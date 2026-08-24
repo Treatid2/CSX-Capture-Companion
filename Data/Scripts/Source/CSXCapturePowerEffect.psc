@@ -7,5 +7,7 @@ Event OnEffectStart(Actor akTarget, Actor akCaster)
         CSXCaptureNative.TakeScreenshot()
     ElseIf Action == 1
         CSXCaptureNative.ToggleFrameSequence()
+    ElseIf Action == 2
+        CSXCaptureNative.ComposeLatestVideo()
     EndIf
 EndEvent

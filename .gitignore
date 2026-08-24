@@ -1,5 +1,7 @@
 /build/
 /dist/
 /.vs/
+**/bin/
+**/obj/
 /CMakeUserPresets.json
 *.user

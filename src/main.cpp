@@ -1,11 +1,15 @@
 #include "CSXCaptureAPI.h"
+#include "VideoComposer.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <spdlog/sinks/basic_file_sink.h>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -98,6 +102,49 @@ namespace
 		return static_cast<std::int32_t>(status.state);
 	}
 
+	bool ComposeLatestVideo(RE::StaticFunctionTag*)
+	{
+		auto* capture = g_capture.load(std::memory_order_acquire);
+		CSPluginAPI::CaptureStatus001 status{};
+		if (!capture || capture->GetCaptureStatus(&status) != CSPluginAPI::CaptureResult001::kSuccess ||
+			status.state != CSPluginAPI::CaptureState001::kComplete || status.sessionId == 0) {
+			SKSE::log::warn("Compose requested without a completed CSX frame sequence");
+			return false;
+		}
+
+		std::uint32_t requiredBytes = 0;
+		if (capture->CopySequencePath(status.sessionId, nullptr, 0, &requiredBytes) !=
+				CSPluginAPI::CaptureResult001::kSuccess ||
+			requiredBytes <= 1) {
+			SKSE::log::error("Could not obtain the completed CSX sequence path");
+			return false;
+		}
+		std::vector<char> pathBytes(requiredBytes);
+		if (capture->CopySequencePath(
+				status.sessionId,
+				pathBytes.data(),
+				requiredBytes,
+				&requiredBytes) != CSPluginAPI::CaptureResult001::kSuccess) {
+			SKSE::log::error("Could not copy the completed CSX sequence path");
+			return false;
+		}
+
+		const std::string utf8Path(pathBytes.data());
+		return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(
+			std::filesystem::u8path(utf8Path));
+	}
+
+	std::int32_t GetComposeState(RE::StaticFunctionTag*)
+	{
+		return static_cast<std::int32_t>(
+			CSXCaptureCompanion::VideoComposer::GetSingleton().GetState());
+	}
+
+	std::string GetComposeStatus(RE::StaticFunctionTag*)
+	{
+		return CSXCaptureCompanion::VideoComposer::GetSingleton().GetStatusText();
+	}
+
 	bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm)
 	{
 		a_vm->RegisterFunction("IsAvailable", "CSXCaptureNative", IsAvailable);
@@ -105,6 +152,9 @@ namespace
 		a_vm->RegisterFunction("TakeScreenshot", "CSXCaptureNative", TakeScreenshot);
 		a_vm->RegisterFunction("ToggleFrameSequence", "CSXCaptureNative", ToggleFrameSequence);
 		a_vm->RegisterFunction("GetCaptureState", "CSXCaptureNative", GetCaptureState);
+		a_vm->RegisterFunction("ComposeLatestVideo", "CSXCaptureNative", ComposeLatestVideo);
+		a_vm->RegisterFunction("GetComposeState", "CSXCaptureNative", GetComposeState);
+		a_vm->RegisterFunction("GetComposeStatus", "CSXCaptureNative", GetComposeStatus);
 		return true;
 	}
 

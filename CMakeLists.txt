@@ -22,15 +22,35 @@ add_commonlibsse_plugin(
     AUTHOR "Treatid2"
     SOURCES
         src/main.cpp
+        src/VideoComposer.cpp
 )
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_include_directories(${PROJECT_NAME} PRIVATE include)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/PCH.h)
+target_link_libraries(
+    ${PROJECT_NAME}
+    PRIVATE
+        mfplat
+        mfreadwrite
+        mfuuid
+        windowscodecs
+        ole32
+)
 
 if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /WX /permissive- /EHsc)
+    target_compile_options(
+        ${PROJECT_NAME}
+        PRIVATE
+            /W4
+            /WX
+            /permissive-
+            /EHsc
+            /utf-8
+            "$<$<CONFIG:Release>:/Zi>"
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
 endif()
 
 install(
@@ -38,6 +58,44 @@ install(
     RUNTIME DESTINATION "SKSE/Plugins"
 )
 install(
+    FILES "$<TARGET_PDB_FILE:${PROJECT_NAME}>"
+    DESTINATION "SKSE/Plugins"
+    OPTIONAL
+)
+install(
     DIRECTORY Data/
     DESTINATION .
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(
+        CSXCaptureComposerSmoke
+        tests/ComposerSmoke.cpp
+        src/VideoComposer.cpp
+    )
+    target_compile_features(CSXCaptureComposerSmoke PRIVATE cxx_std_23)
+    target_include_directories(CSXCaptureComposerSmoke PRIVATE include)
+    target_compile_definitions(CSXCaptureComposerSmoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_precompile_headers(CSXCaptureComposerSmoke PRIVATE include/PCH.h)
+    target_link_libraries(
+        CSXCaptureComposerSmoke
+        PRIVATE
+            CommonLibSSE::CommonLibSSE
+            mfplat
+            mfreadwrite
+            mfuuid
+            windowscodecs
+            ole32
+    )
+    if(MSVC)
+        target_compile_options(CSXCaptureComposerSmoke PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    endif()
+    add_test(
+        NAME composer-smoke
+        COMMAND
+            pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/Run-ComposerSmoke.ps1"
+            -Executable "$<TARGET_FILE:CSXCaptureComposerSmoke>"
+            -WorkRoot "${CMAKE_CURRENT_BINARY_DIR}/composer-smoke"
+    )
+endif()
