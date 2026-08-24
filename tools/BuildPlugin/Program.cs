@@ -5,6 +5,7 @@ using Mutagen.Bethesda.Skyrim;
 
 const string PluginName = "CSXCaptureCompanion.esp";
 const ushort RecordFormVersion = 44;
+var voiceEquipType = new FormKey(ModKey.FromNameAndExtension("Skyrim.esm"), 0x25BEE);
 
 var recordIds = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
 {
@@ -76,21 +77,24 @@ var screenshotPower = AddPower(
     "CSXCaptureScreenshotPower",
     "Capture Screenshot",
     "Capture one lossless CSX screenshot.",
-    screenshotEffect);
+    screenshotEffect,
+    voiceEquipType);
 var togglePower = AddPower(
     mod,
     recordIds["CSXCaptureTogglePower"],
     "CSXCaptureTogglePower",
     "Start/Stop Frame Capture",
     "Start or stop a lossless CSX frame sequence.",
-    toggleEffect);
+    toggleEffect,
+    voiceEquipType);
 var composePower = AddPower(
     mod,
     recordIds["CSXCaptureComposePower"],
     "CSXCaptureComposePower",
     "Compose Latest Capture",
     "Compose the latest completed frame sequence into video.",
-    composeEffect);
+    composeEffect,
+    voiceEquipType);
 
 var mcmScript = new ScriptEntry
 {
@@ -200,7 +204,8 @@ static Spell AddPower(
     string editorId,
     string name,
     string description,
-    MagicEffect baseEffect)
+    MagicEffect baseEffect,
+    FormKey voiceEquipType)
 {
     var spell = new Spell(new FormKey(mod.ModKey, id), SkyrimRelease.SkyrimSE)
     {
@@ -217,6 +222,7 @@ static Spell AddPower(
         CastDuration = 0.0f,
         Range = 0.0f,
     };
+    spell.EquipmentType.SetTo(voiceEquipType);
     var effect = new Effect
     {
         Data = new EffectData
@@ -246,6 +252,7 @@ static void AddObjectProperty(ScriptEntry script, string name, FormKey target)
 
 static int VerifyPlugin(string pluginPath, IReadOnlyDictionary<string, uint> expectedIds)
 {
+    var expectedVoiceEquipType = new FormKey(ModKey.FromNameAndExtension("Skyrim.esm"), 0x25BEE);
     if (!File.Exists(pluginPath))
     {
         Console.Error.WriteLine($"Plugin does not exist: {pluginPath}");
@@ -307,6 +314,20 @@ static int VerifyPlugin(string pluginPath, IReadOnlyDictionary<string, uint> exp
             errors.Add($"{editorId} does not bind Action={action}.");
     }
 
+    foreach (var editorId in new[]
+    {
+        "CSXCaptureScreenshotPower",
+        "CSXCaptureTogglePower",
+        "CSXCaptureComposePower",
+    })
+    {
+        var spell = mod.Spells.SingleOrDefault(record => record.EditorID == editorId);
+        if (spell?.Type != SpellType.LesserPower)
+            errors.Add($"{editorId} is not a Lesser Power.");
+        if (spell?.EquipmentType.FormKey != expectedVoiceEquipType)
+            errors.Add($"{editorId} does not use Skyrim's Voice equip type.");
+    }
+
     if (errors.Count != 0)
     {
         foreach (var error in errors)
@@ -314,6 +335,6 @@ static int VerifyPlugin(string pluginPath, IReadOnlyDictionary<string, uint> exp
         return 4;
     }
 
-    Console.WriteLine("Verified ESL flag, 7 stable records, MCM alias, spell properties, and action bindings.");
+    Console.WriteLine("Verified ESL flag, 7 stable records, MCM alias, Voice-equipped Lesser Powers, and action bindings.");
     return 0;
 }
