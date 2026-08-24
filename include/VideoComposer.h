@@ -9,6 +9,10 @@
 
 namespace CSXCaptureCompanion
 {
+	using NotificationCallback = void (*)(std::string);
+	void SetNotificationCallback(NotificationCallback a_callback) noexcept;
+	void ShowNotification(std::string a_message);
+
 	enum class ComposeState : std::int32_t
 	{
 		kIdle = 0,

@@ -21,6 +21,23 @@ namespace CSXCaptureCompanion
 {
 	namespace
 	{
+		std::atomic<NotificationCallback> g_notificationCallback{ nullptr };
+	}
+
+	void SetNotificationCallback(NotificationCallback a_callback) noexcept
+	{
+		g_notificationCallback.store(a_callback, std::memory_order_release);
+	}
+
+	void ShowNotification(std::string a_message)
+	{
+		if (const auto callback = g_notificationCallback.load(std::memory_order_acquire)) {
+			callback(std::move(a_message));
+		}
+	}
+
+	namespace
+	{
 		using Microsoft::WRL::ComPtr;
 		using json = nlohmann::json;
 
@@ -362,9 +379,11 @@ namespace CSXCaptureCompanion
 	{
 		const auto current = state.load(std::memory_order_acquire);
 		if (current == ComposeState::kQueued || current == ComposeState::kEncoding) {
+			ShowNotification("Video composer is busy");
 			return false;
 		}
 		SetStatus(ComposeState::kQueued, "Video composition queued.");
+		ShowNotification("Video composition queued");
 		worker = std::jthread([this, sequenceDirectory = a_sequenceDirectory] {
 			Run(sequenceDirectory);
 		});
@@ -424,12 +443,15 @@ namespace CSXCaptureCompanion
 			}
 			SetStatus(ComposeState::kComplete, std::move(message));
 			SKSE::log::info("{}", GetStatusText());
+			ShowNotification("Video composition complete");
 		} catch (const std::exception& exception) {
 			SetStatus(ComposeState::kFailed, std::string("Video composition failed: ") + exception.what());
 			SKSE::log::error("{}", GetStatusText());
+			ShowNotification("Video composition failed - see CSXCaptureCompanion.log");
 		} catch (...) {
 			SetStatus(ComposeState::kFailed, "Video composition failed with an unknown error.");
 			SKSE::log::error("{}", GetStatusText());
+			ShowNotification("Video composition failed - see CSXCaptureCompanion.log");
 		}
 	}
 

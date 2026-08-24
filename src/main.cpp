@@ -16,6 +16,15 @@ namespace
 	std::atomic<CSPluginAPI::ICSCaptureInterface001*> g_capture{ nullptr };
 	std::atomic g_eye{ CSPluginAPI::CaptureEye001::kLeft };
 
+	void ShowInGameNotification(std::string a_message)
+	{
+		if (auto* taskInterface = SKSE::GetTaskInterface()) {
+			taskInterface->AddTask([message = std::move(a_message)] {
+				RE::SendHUDMessage::ShowHUDMessage(message.c_str(), nullptr, true);
+			});
+		}
+	}
+
 	bool ConnectToCSX()
 	{
 		CSPluginAPI::CSMessage request{};
@@ -109,6 +118,7 @@ namespace
 		if (!capture || capture->GetCaptureStatus(&status) != CSPluginAPI::CaptureResult001::kSuccess ||
 			status.state != CSPluginAPI::CaptureState001::kComplete || status.sessionId == 0) {
 			SKSE::log::warn("Compose requested without a completed CSX frame sequence");
+			CSXCaptureCompanion::ShowNotification("No completed capture is ready");
 			return false;
 		}
 
@@ -117,6 +127,7 @@ namespace
 				CSPluginAPI::CaptureResult001::kSuccess ||
 			requiredBytes <= 1) {
 			SKSE::log::error("Could not obtain the completed CSX sequence path");
+			CSXCaptureCompanion::ShowNotification("Video composition unavailable - see log");
 			return false;
 		}
 		std::vector<char> pathBytes(requiredBytes);
@@ -126,6 +137,7 @@ namespace
 				requiredBytes,
 				&requiredBytes) != CSPluginAPI::CaptureResult001::kSuccess) {
 			SKSE::log::error("Could not copy the completed CSX sequence path");
+			CSXCaptureCompanion::ShowNotification("Video composition unavailable - see log");
 			return false;
 		}
 
@@ -187,6 +199,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	InitializeLogging();
 	SKSE::Init(a_skse);
+	CSXCaptureCompanion::SetNotificationCallback(ShowInGameNotification);
 	SKSE::GetPapyrusInterface()->Register(RegisterPapyrus);
 	SKSE::GetMessagingInterface()->RegisterListener(OnSKSEMessage);
 	SKSE::log::info("CSX Capture Companion loaded");
