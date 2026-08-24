@@ -72,6 +72,10 @@ install(
         README.md
     DESTINATION "Docs/CSX Capture Companion"
 )
+install(
+    DIRECTORY docs/legal/
+    DESTINATION "Docs/CSX Capture Companion/Legal"
+)
 
 include(CTest)
 if(BUILD_TESTING)

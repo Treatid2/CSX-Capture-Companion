@@ -85,3 +85,8 @@ CSX Capture Companion is free software licensed under the GNU General Public
 License, version 3 (`GPL-3.0-only`). See [LICENSE](LICENSE) for the complete
 license text. Corresponding source code is published at
 <https://github.com/Treatid2/CSX-Capture-Companion>.
+
+Third-party copyright, licence, exception, and source notices are collected in
+[docs/legal/THIRD_PARTY_NOTICES.md](docs/legal/THIRD_PARTY_NOTICES.md). The
+release archive includes that notice and every applicable licence text under
+`Docs/CSX Capture Companion/Legal`.
