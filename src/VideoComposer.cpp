@@ -151,47 +151,82 @@ namespace CSXCaptureCompanion
 			return result;
 		}
 
-		std::vector<StreamPlan> ReadManifest(const std::filesystem::path& a_sequenceDirectory)
+		std::filesystem::path ManifestAssetPath(
+			const std::filesystem::path& a_sequenceDirectory,
+			const json& a_artifact)
 		{
-			const auto manifestPath = a_sequenceDirectory / "sequence.json";
+			if (!a_artifact.is_object() || !a_artifact.contains("path") || !a_artifact["path"].is_string())
+				throw std::runtime_error("A completed frame is missing its artifact path.");
+			const auto wide = Utf8ToWide(a_artifact["path"].get<std::string>());
+			const std::filesystem::path path(wide);
+			return path.is_absolute() ? path : a_sequenceDirectory / path;
+		}
+
+		std::vector<StreamPlan> ReadManifest(const std::filesystem::path& a_manifestOrDirectory)
+		{
+			const auto manifestPath = std::filesystem::is_directory(a_manifestOrDirectory) ?
+			                          a_manifestOrDirectory / "sequence.json" :
+			                          a_manifestOrDirectory;
+			const auto sequenceDirectory = manifestPath.parent_path();
 			std::ifstream stream(manifestPath, std::ios::binary);
 			if (!stream) {
 				throw std::runtime_error("The completed sequence.json could not be opened.");
 			}
 			json manifest;
 			stream >> manifest;
-			if (manifest.value("schema", "") != "csx.frame-sequence/1" ||
-				manifest.value("state", "") != "complete") {
-				throw std::runtime_error("The manifest is not a completed CSX frame sequence.");
-			}
-
-			const auto eye = manifest.value("eye", "Left");
 			std::vector<StreamPlan> plans;
-			if (eye == "Both") {
-				plans.push_back({ "-left", {} });
-				plans.push_back({ "-right", {} });
-			} else if (eye == "Right") {
-				plans.push_back({ "-right", {} });
-			} else {
-				plans.push_back({ "-left", {} });
-			}
-
-			for (const auto& entry : manifest.at("frames")) {
-				if (!entry.value("written", false)) {
-					continue;
+			if (manifest.value("schema", "") == "csx.frame-sequence/1") {
+				if (manifest.value("state", "") != "complete")
+					throw std::runtime_error("The legacy manifest is not complete.");
+				const auto eye = manifest.value("eye", "Left");
+				if (eye == "Both") {
+					plans.push_back({ "-left", {} });
+					plans.push_back({ "-right", {} });
+				} else if (eye == "Right") {
+					plans.push_back({ "-right", {} });
+				} else {
+					plans.push_back({ "-left", {} });
 				}
-				const auto timestamp = entry.at("timestampUs").get<std::uint64_t>();
-				const auto& paths = entry.at("paths");
-				if (!paths.is_array() || paths.size() != plans.size()) {
-					throw std::runtime_error("A written frame has the wrong number of eye paths.");
-				}
-				for (std::size_t index = 0; index < plans.size(); ++index) {
-					const auto relativeWide = Utf8ToWide(paths.at(index).get<std::string>());
-					const auto path = a_sequenceDirectory / std::filesystem::path(relativeWide);
-					if (!std::filesystem::is_regular_file(path)) {
-						throw std::runtime_error("A lossless source frame is missing.");
+				for (const auto& entry : manifest.at("frames")) {
+					if (!entry.value("written", false))
+						continue;
+					const auto timestamp = entry.at("timestampUs").get<std::uint64_t>();
+					const auto& paths = entry.at("paths");
+					if (!paths.is_array() || paths.size() != plans.size())
+						throw std::runtime_error("A written frame has the wrong number of eye paths.");
+					for (std::size_t index = 0; index < plans.size(); ++index) {
+						const auto path = sequenceDirectory / std::filesystem::path(Utf8ToWide(paths.at(index).get<std::string>()));
+						if (!std::filesystem::is_regular_file(path))
+							throw std::runtime_error("A lossless source frame is missing.");
+						plans[index].frames.push_back({ timestamp, path });
 					}
-					plans[index].frames.push_back({ timestamp, path });
+				}
+			} else {
+				const auto contract = manifest.value("contract", json::object());
+				if (contract.value("name", "") != "csx.screenshot" || contract.value("major", 0) != 1 ||
+					manifest.value("state", "") != "final")
+					throw std::runtime_error("The manifest is not a final Screenshot API v1 sequence.");
+				const auto outputs = manifest.at("capture").at("outputs");
+				if (!outputs.is_array() || outputs.empty())
+					throw std::runtime_error("The Screenshot API manifest has no outputs.");
+				for (const auto& output : outputs) {
+					const auto suffix = output.value("nameSuffix", output.value("view", std::string("video")));
+					plans.push_back({ "-" + suffix, {} });
+				}
+				for (const auto& child : manifest.at("children")) {
+					const auto state = child.value("state", std::string{});
+					if (state != "completed" && state != "completed_with_warnings")
+						continue;
+					const auto timestamp = child.at("scheduledTimestampUs").get<std::uint64_t>();
+					const auto& artifacts = child.at("artifacts");
+					if (!artifacts.is_array() || artifacts.size() != plans.size())
+						throw std::runtime_error("A completed frame has the wrong number of output artifacts.");
+					for (std::size_t index = 0; index < plans.size(); ++index) {
+						const auto path = ManifestAssetPath(sequenceDirectory, artifacts.at(index));
+						if (!std::filesystem::is_regular_file(path))
+							throw std::runtime_error("A lossless source frame is missing.");
+						plans[index].frames.push_back({ timestamp, path });
+					}
 				}
 			}
 
@@ -404,6 +439,8 @@ namespace CSXCaptureCompanion
 	void VideoComposer::Run(std::filesystem::path a_sequenceDirectory)
 	{
 		try {
+			if (!std::filesystem::is_directory(a_sequenceDirectory))
+				a_sequenceDirectory = a_sequenceDirectory.parent_path();
 			SetStatus(ComposeState::kEncoding, "Encoding the latest completed capture.");
 			ComRuntime com;
 			MediaFoundationRuntime mediaFoundation;

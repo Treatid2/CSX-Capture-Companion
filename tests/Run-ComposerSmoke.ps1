@@ -30,7 +30,7 @@ $colors = @(
     [System.Drawing.Color]::FromArgb(255, 32, 80, 220)
 )
 
-$manifestFrames = @()
+$manifestChildren = @()
 $formats = @(
     @{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp },
     @{ Extension = '.png'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Png },
@@ -54,25 +54,34 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
             $bitmap.Dispose()
         }
     }
-    $manifestFrames += [ordered]@{
-        index = $index + 1
-        timestampUs = [uint64](1000000 + ($index * 16667))
-        written = $true
-        paths = @("left/$name", "right/$name")
-        error = $null
-    }
+	$manifestChildren += [ordered]@{
+		ordinal = $index + 1
+		requestId = "smoke-frame-$($index + 1)"
+		state = 'completed'
+		scheduledEngineFrame = [uint64](100 + ($index * 12))
+		scheduledTimestampUs = [uint64](1000000 + ($index * 16667))
+		artifacts = @(
+			[ordered]@{ path = (Join-Path $leftFrames $name); committed = $true },
+			[ordered]@{ path = (Join-Path $rightFrames $name); committed = $true }
+		)
+		error = $null
+	}
 }
 
 $manifest = [ordered]@{
-    schema = 'csx.frame-sequence/1'
-    sessionId = 1
-    state = 'complete'
-    eye = 'Both'
-    audio = $false
-    startedUtc = '2026-08-24T00:00:00.000Z'
+	contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
+	sessionId = 'smoke-session'
+	requestId = 'smoke-sequence'
+	state = 'final'
+	capture = [ordered]@{
+		outputs = @(
+			[ordered]@{ view = 'left_eye'; nameSuffix = 'left' },
+			[ordered]@{ view = 'right_eye'; nameSuffix = 'right' }
+		)
+	}
     updatedUtc = '2026-08-24T00:00:01.000Z'
-    counts = [ordered]@{ scheduled = 3; written = 3; dropped = 0 }
-    frames = $manifestFrames
+	counts = [ordered]@{ requested = 3; scheduled = 3; written = 3; dropped = 0; failed = 0; inFlight = 0 }
+	children = $manifestChildren
 }
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $sequence 'sequence.json') -Encoding utf8NoBOM
 

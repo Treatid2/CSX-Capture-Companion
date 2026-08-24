@@ -1,4 +1,5 @@
-#include "CSXCaptureAPI.h"
+#include "CSXServiceAPI.h"
+#include "CSXScreenshotAPI.h"
 #include "VideoComposer.h"
 
 #include <RE/Skyrim.h>
@@ -7,14 +8,22 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <nlohmann/json.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <string>
-#include <vector>
 
 namespace
 {
-	std::atomic<CSPluginAPI::ICSCaptureInterface001*> g_capture{ nullptr };
-	std::atomic g_eye{ CSPluginAPI::CaptureEye001::kLeft };
+	using json = nlohmann::json;
+
+	std::atomic<const CSX::ScreenshotAPI::Interface001*> g_screenshot{ nullptr };
+	std::atomic_int g_eye{ 0 };
+	std::atomic_uint64_t g_commandSequence{ 1 };
+	std::mutex g_captureMutex;
+	std::string g_activeSequenceId;
+	std::filesystem::path g_latestManifestPath;
+	std::int32_t g_lastCaptureState = 0;
 
 	void ShowInGameNotification(std::string a_message)
 	{
@@ -25,48 +34,175 @@ namespace
 		}
 	}
 
-	bool ConnectToCSX()
+	std::string NextCommandId(std::string_view a_action)
 	{
-		CSPluginAPI::CSMessage request{};
-		auto* messaging = SKSE::GetMessagingInterface();
-		if (!messaging || !messaging->Dispatch(
-				CSPluginAPI::CSMessage::kMessage_GetInterface,
-				&request,
-				sizeof(request),
-				CSPluginAPI::CSPluginName) ||
-			!request.GetApiFunction) {
-			SKSE::log::warn("CSX capture API discovery failed");
-			return false;
-		}
-
-		auto* api = static_cast<CSPluginAPI::ICSInterface001*>(
-			request.GetApiFunction(CSPluginAPI::CSInterfaceRevision005));
-		if (!api || api->getBuildNumber() < CSPluginAPI::MinimumCaptureBuild) {
-			SKSE::log::warn("CSX build 12 or later is required");
-			return false;
-		}
-
-		auto* capture = api->GetCaptureInterface001();
-		g_capture.store(capture, std::memory_order_release);
-		SKSE::log::info("Connected to CSX lossless capture API");
-		return capture != nullptr;
+		return std::format(
+			"{}:{}:{}",
+			a_action,
+			GetTickCount64(),
+			g_commandSequence.fetch_add(1, std::memory_order_relaxed));
 	}
 
-	CSPluginAPI::CaptureEye001 SanitizeEye(std::int32_t a_eye)
+	json Dispatch(json a_request)
 	{
-		switch (a_eye) {
-		case 1:
-			return CSPluginAPI::CaptureEye001::kRight;
-		case 2:
-			return CSPluginAPI::CaptureEye001::kBoth;
-		default:
-			return CSPluginAPI::CaptureEye001::kLeft;
+		const auto* service = g_screenshot.load(std::memory_order_acquire);
+		if (!service || !service->Dispatch)
+			return { { "ok", false }, { "error", { { "code", "service_unavailable" } } } };
+
+		a_request["contractMajor"] = CSX::ScreenshotAPI::ServiceMajor;
+		a_request["clientId"] = "csx.capture.companion";
+		if (!a_request.contains("commandId"))
+			a_request["commandId"] = NextCommandId(a_request.value("action", std::string("request")));
+		const auto text = a_request.dump();
+		CSX::ScreenshotAPI::Request001 request;
+		request.jsonUtf8 = text.data();
+		request.jsonBytes = static_cast<std::uint32_t>(text.size());
+		CSX::ScreenshotAPI::Response001 response;
+		const auto status = service->Dispatch(service->context, &request, &response);
+		if (status != CSX::ScreenshotAPI::Status::kSuccess || !response.jsonUtf8) {
+			SKSE::log::error("CSX screenshot transport failed ({})", static_cast<std::uint32_t>(status));
+			return {
+				{ "ok", false },
+				{ "error", { { "code", "transport_error" }, { "status", static_cast<std::uint32_t>(status) } } },
+			};
 		}
+		try {
+			return json::parse(response.jsonUtf8, response.jsonUtf8 + response.jsonBytes);
+		} catch (const json::exception& error) {
+			SKSE::log::error("CSX screenshot response was invalid JSON: {}", error.what());
+			return { { "ok", false }, { "error", { { "code", "invalid_response" } } } };
+		}
+	}
+
+	bool ConnectToCSX()
+	{
+		CSX::ServiceAPI::RegistryMessage001 request;
+		auto* messaging = SKSE::GetMessagingInterface();
+		if (!messaging || !messaging->Dispatch(
+				CSX::ServiceAPI::RegistryMessageType,
+				&request,
+				sizeof(request),
+				CSX::ServiceAPI::ProviderName) ||
+			request.status != CSX::ServiceAPI::Status::kSuccess || !request.registry) {
+			SKSE::log::warn("CSX service-registry discovery failed");
+			return false;
+		}
+
+		CSX::ServiceAPI::ServiceQuery001 query;
+		query.name = CSX::ScreenshotAPI::ServiceName;
+		query.major = CSX::ScreenshotAPI::ServiceMajor;
+		query.minimumMinor = CSX::ScreenshotAPI::ServiceMinor;
+		query.maximumMinor = CSX::ScreenshotAPI::ServiceMinor;
+		query.requiredCapabilities =
+			CSX::ServiceAPI::kCapabilityInspection |
+			CSX::ServiceAPI::kCapabilityRuntimeMutation |
+			CSX::ServiceAPI::kCapabilityAsynchronousOperations |
+			CSX::ServiceAPI::kCapabilityEventStream;
+		const void* opaque = nullptr;
+		CSX::ServiceAPI::ServiceDescriptor001 descriptor;
+		const auto status = request.registry->QueryService(
+			request.registry->context, &query, &opaque, &descriptor);
+		if (status != CSX::ServiceAPI::Status::kSuccess || !opaque) {
+			SKSE::log::warn("CSX Screenshot API v1 is unavailable ({})", static_cast<std::uint32_t>(status));
+			g_screenshot.store(nullptr, std::memory_order_release);
+			return false;
+		}
+
+		auto* service = static_cast<const CSX::ScreenshotAPI::Interface001*>(opaque);
+		if (service->structSize < sizeof(CSX::ScreenshotAPI::Interface001) || !service->Dispatch) {
+			SKSE::log::warn("CSX Screenshot API v1 returned an undersized interface");
+			return false;
+		}
+		g_screenshot.store(service, std::memory_order_release);
+		SKSE::log::info("Connected to CSX Screenshot API {}.{} through CSXR", descriptor.major, descriptor.minor);
+		return true;
+	}
+
+	std::int32_t SanitizeEye(std::int32_t a_eye)
+	{
+		return a_eye == 1 || a_eye == 2 ? a_eye : 0;
+	}
+
+	json CaptureDescriptor(std::int32_t a_eye, std::string_view a_format)
+	{
+		json outputs = json::array();
+		auto append = [&](std::string_view a_view, std::string_view a_suffix) {
+			outputs.push_back({
+				{ "view", a_view },
+				{ "encoding", { { "format", a_format }, { "colourContract", "sdr_srgb" } } },
+				{ "nameSuffix", a_suffix },
+			});
+		};
+		if (a_eye == 2) {
+			append("left_eye", "left");
+			append("right_eye", "right");
+		} else if (a_eye == 1) {
+			append("right_eye", "right");
+		} else {
+			append("left_eye", "left");
+		}
+		return {
+			{ "source", { { "kind", "hmd_submission" }, { "fallback", "reject" } } },
+			{ "outputs", std::move(outputs) },
+			{ "destination", { { "policy", "settings_default" }, { "overwrite", "never" } } },
+			{ "clipboard", "none" },
+			{ "tags", { { "producer", "CSX Capture Companion" } } },
+		};
+	}
+
+	bool IsTerminal(std::string_view a_state)
+	{
+		return a_state == "completed" || a_state == "completed_with_warnings" ||
+		       a_state == "failed" || a_state == "failed_partial" ||
+		       a_state == "rejected" || a_state == "cancelled" ||
+		       a_state == "cancelled_partial" || a_state == "stopped" ||
+		       a_state == "dropped";
+	}
+
+	std::int32_t CaptureStateCode(std::string_view a_state)
+	{
+		if (a_state == "stop_requested" || a_state == "finalizing")
+			return 2;
+		if (a_state == "completed" || a_state == "completed_with_warnings" || a_state == "stopped")
+			return 3;
+		if (a_state == "failed" || a_state == "failed_partial" || a_state == "rejected" ||
+			a_state == "cancelled" || a_state == "cancelled_partial" || a_state == "dropped")
+			return 4;
+		return a_state.empty() ? 0 : 1;
+	}
+
+	std::int32_t RefreshSequenceState()
+	{
+		std::string requestId;
+		{
+			std::lock_guard lock(g_captureMutex);
+			requestId = g_activeSequenceId;
+			if (requestId.empty())
+				return g_lastCaptureState;
+		}
+		const auto response = Dispatch({ { "action", "request_get" }, { "requestId", requestId } });
+		if (!response.value("ok", false) || !response.contains("result"))
+			return -1;
+
+		const auto& receipt = response["result"];
+		const auto state = receipt.value("state", std::string{});
+		const auto code = CaptureStateCode(state);
+		std::lock_guard lock(g_captureMutex);
+		g_lastCaptureState = code;
+		if (IsTerminal(state)) {
+			if (receipt.contains("manifest") && receipt["manifest"].is_object()) {
+				const auto& finalPath = receipt["manifest"]["finalPath"];
+				if (finalPath.is_string())
+					g_latestManifestPath = std::filesystem::u8path(finalPath.get<std::string>());
+			}
+			g_activeSequenceId.clear();
+		}
+		return code;
 	}
 
 	bool IsAvailable(RE::StaticFunctionTag*)
 	{
-		return g_capture.load(std::memory_order_acquire) != nullptr;
+		return g_screenshot.load(std::memory_order_acquire) != nullptr;
 	}
 
 	void SetEye(RE::StaticFunctionTag*, std::int32_t a_eye)
@@ -76,80 +212,81 @@ namespace
 
 	bool TakeScreenshot(RE::StaticFunctionTag*)
 	{
-		auto* capture = g_capture.load(std::memory_order_acquire);
-		return capture && capture->RequestScreenshot(g_eye.load(std::memory_order_acquire)) ==
-		                      CSPluginAPI::CaptureResult001::kSuccess;
+		const auto response = Dispatch({
+			{ "action", "capture" }, { "useSettings", false },
+			{ "capture", CaptureDescriptor(g_eye.load(std::memory_order_acquire), "png") },
+		});
+		return response.value("ok", false);
 	}
 
 	bool ToggleFrameSequence(RE::StaticFunctionTag*)
 	{
-		auto* capture = g_capture.load(std::memory_order_acquire);
-		if (!capture) {
+		if (!g_screenshot.load(std::memory_order_acquire))
+			return false;
+		(void)RefreshSequenceState();
+		std::string activeId;
+		{
+			std::lock_guard lock(g_captureMutex);
+			activeId = g_activeSequenceId;
+		}
+		if (!activeId.empty()) {
+			const auto response = Dispatch({ { "action", "sequence_stop" }, { "requestId", activeId } });
+			if (response.value("ok", false)) {
+				std::lock_guard lock(g_captureMutex);
+				g_lastCaptureState = 2;
+				return true;
+			}
 			return false;
 		}
-		CSPluginAPI::CaptureStatus001 status{};
-		if (capture->GetCaptureStatus(&status) != CSPluginAPI::CaptureResult001::kSuccess) {
+
+		const auto response = Dispatch({
+			{ "action", "sequence_start" },
+			{ "sequence", {
+				{ "frameCount", 300 }, { "useSettings", false },
+				{ "schedule", { { "basis", "game_frames" }, { "intervalFrames", 12 } } },
+				{ "backpressure", { { "policy", "skip" }, { "maximumConsecutiveSkips", 5 } } },
+				{ "failurePolicy", "continue" },
+				{ "capture", CaptureDescriptor(g_eye.load(std::memory_order_acquire), "bmp") },
+				{ "packaging", { { "frameManifest", true }, { "previewVideo", { { "requested", false } } } } },
+			} },
+		});
+		if (!response.value("ok", false) || !response.contains("result"))
 			return false;
-		}
-		if (status.state == CSPluginAPI::CaptureState001::kCapturing) {
-			return capture->StopFrameSequence() == CSPluginAPI::CaptureResult001::kSuccess;
-		}
-		if (status.state == CSPluginAPI::CaptureState001::kFlushing) {
+		const auto requestId = response["result"].value("requestId", std::string{});
+		if (requestId.empty())
 			return false;
-		}
-		return capture->StartFrameSequence(g_eye.load(std::memory_order_acquire)) ==
-		       CSPluginAPI::CaptureResult001::kSuccess;
+		std::lock_guard lock(g_captureMutex);
+		g_activeSequenceId = requestId;
+		g_lastCaptureState = 1;
+		return true;
 	}
 
 	std::int32_t GetCaptureState(RE::StaticFunctionTag*)
 	{
-		auto* capture = g_capture.load(std::memory_order_acquire);
-		CSPluginAPI::CaptureStatus001 status{};
-		if (!capture || capture->GetCaptureStatus(&status) != CSPluginAPI::CaptureResult001::kSuccess) {
+		if (!g_screenshot.load(std::memory_order_acquire))
 			return -1;
-		}
-		return static_cast<std::int32_t>(status.state);
+		return RefreshSequenceState();
 	}
 
 	bool ComposeLatestVideo(RE::StaticFunctionTag*)
 	{
-		auto* capture = g_capture.load(std::memory_order_acquire);
-		CSPluginAPI::CaptureStatus001 status{};
-		if (!capture || capture->GetCaptureStatus(&status) != CSPluginAPI::CaptureResult001::kSuccess ||
-			status.state != CSPluginAPI::CaptureState001::kComplete || status.sessionId == 0) {
-			SKSE::log::warn("Compose requested without a completed CSX frame sequence");
+		(void)RefreshSequenceState();
+		std::filesystem::path manifest;
+		{
+			std::lock_guard lock(g_captureMutex);
+			manifest = g_latestManifestPath;
+		}
+		if (manifest.empty()) {
+			SKSE::log::warn("Compose requested without a completed Screenshot API sequence receipt");
 			CSXCaptureCompanion::ShowNotification("No completed capture is ready");
 			return false;
 		}
-
-		std::uint32_t requiredBytes = 0;
-		if (capture->CopySequencePath(status.sessionId, nullptr, 0, &requiredBytes) !=
-				CSPluginAPI::CaptureResult001::kSuccess ||
-			requiredBytes <= 1) {
-			SKSE::log::error("Could not obtain the completed CSX sequence path");
-			CSXCaptureCompanion::ShowNotification("Video composition unavailable - see log");
-			return false;
-		}
-		std::vector<char> pathBytes(requiredBytes);
-		if (capture->CopySequencePath(
-				status.sessionId,
-				pathBytes.data(),
-				requiredBytes,
-				&requiredBytes) != CSPluginAPI::CaptureResult001::kSuccess) {
-			SKSE::log::error("Could not copy the completed CSX sequence path");
-			CSXCaptureCompanion::ShowNotification("Video composition unavailable - see log");
-			return false;
-		}
-
-		const std::string utf8Path(pathBytes.data());
-		return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(
-			std::filesystem::u8path(utf8Path));
+		return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(manifest);
 	}
 
 	std::int32_t GetComposeState(RE::StaticFunctionTag*)
 	{
-		return static_cast<std::int32_t>(
-			CSXCaptureCompanion::VideoComposer::GetSingleton().GetState());
+		return static_cast<std::int32_t>(CSXCaptureCompanion::VideoComposer::GetSingleton().GetState());
 	}
 
 	std::string GetComposeStatus(RE::StaticFunctionTag*)
@@ -173,17 +310,15 @@ namespace
 	void OnSKSEMessage(SKSE::MessagingInterface::Message* a_message)
 	{
 		if (a_message && (a_message->type == SKSE::MessagingInterface::kPostLoad ||
-		                  a_message->type == SKSE::MessagingInterface::kDataLoaded)) {
+		                  a_message->type == SKSE::MessagingInterface::kDataLoaded))
 			(void)ConnectToCSX();
-		}
 	}
 
 	void InitializeLogging()
 	{
 		auto directory = SKSE::log::log_directory();
-		if (!directory) {
+		if (!directory)
 			return;
-		}
 		*directory /= "CSXCaptureCompanion.log";
 		auto logger = std::make_shared<spdlog::logger>(
 			"global log",

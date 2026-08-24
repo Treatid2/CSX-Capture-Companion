@@ -48,8 +48,15 @@ Source: <https://github.com/Domek97/Throwing-Stuff-VR>
 
 ## External runtime prerequisites
 
+The ABI declarations in `include/CSXServiceAPI.h` and
+`include/CSXScreenshotAPI.h` are maintained copies of the corresponding CSX
+public headers. Community Shaders Expanded is GPL-3.0; those declarations and
+this companion are covered by the GPLv3 text included as `LICENSE`.
+
+Source: <https://github.com/ParticleTroned/skyrim-community-shaders>
+
 The following projects or platform components are required or used at runtime
-but are not redistributed in this archive:
+but their binaries are not redistributed in this archive:
 
 - Community Shaders Expanded (CSX) 3.19-VR or later supplies the capture API
   and writes the lossless screenshots and frame sequences.

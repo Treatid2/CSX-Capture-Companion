@@ -15,16 +15,24 @@ sets. Audio is outside the first version.
   for asynchronous MP4 composition.
 - MCM toggles install or remove those powers and select Left, Right, or Both eyes.
 
-The native plugin discovers CSX revision 5 through SKSE messaging and calls only
-`ICSCaptureInterface001`. The powers are therefore examples of API control
-surfaces rather than alternate capture implementations.
+The 0.1.0 demonstrator requests PNG stills and a bounded 300-frame BMP
+sequence sampled every 12 rendered game frames. It uses one eye output or two
+synchronized Left/Right outputs, disables clipboard and CSX preview packaging,
+records backpressure in the manifest, and never starts a second sequence while
+the first receipt is active.
+
+The native plugin discovers CSX's `CSXR` service registry through SKSE
+messaging, queries `csx.screenshot` major version 1, and sends the same
+asynchronous JSON commands used by CSX and DevBench. The powers are therefore
+examples of public API control surfaces rather than alternate capture
+implementations. The former capture-specific `CSAP` vtable is not used.
 
 ## Output
 
 CSX writes screenshots beneath the Windows Pictures Known Folder and frame sets
 beneath the Windows Videos Known Folder. This mod does not redirect either path
 to the Skyrim installation. After CSX reports a sequence complete, this mod can
-obtain its UTF-8 directory through `CopySequencePath`.
+obtain the final manifest path from the terminal Screenshot API receipt.
 
 ## Video composition
 
