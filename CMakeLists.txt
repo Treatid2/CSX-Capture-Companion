@@ -66,6 +66,12 @@ install(
     DIRECTORY Data/
     DESTINATION .
 )
+install(
+    FILES
+        LICENSE
+        README.md
+    DESTINATION "Docs/CSX Capture Companion"
+)
 
 include(CTest)
 if(BUILD_TESTING)

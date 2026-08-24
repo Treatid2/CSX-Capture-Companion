@@ -70,9 +70,18 @@ dotnet run --project tools\BuildPlugin\BuildPlugin.csproj -c Release -- --verify
 ```
 
 Runtime prerequisites are SKSE, Address Library as required by the selected
-CommonLibSSE-NG target, CSX build 12 or later, and SkyUI for the MCM.
+CommonLibSSE-NG target, CSX 3.19-VR or later, and SkyUI for the MCM.
 Video composition additionally requires the Windows Media Foundation H.264
 encoder supplied with standard Windows 10 and Windows 11 installations.
 
 The video backend and its dependency boundary are recorded in
 `docs/EncoderDesign.md`.
+
+## License
+
+Copyright (C) 2026 Treatid2.
+
+CSX Capture Companion is free software licensed under the GNU General Public
+License, version 3 (`GPL-3.0-only`). See [LICENSE](LICENSE) for the complete
+license text. Corresponding source code is published at
+<https://github.com/Treatid2/CSX-Capture-Companion>.
