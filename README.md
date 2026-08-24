@@ -30,7 +30,7 @@ obtain its UTF-8 directory through `CopySequencePath`.
 
 Video encoding belongs in this repository, never in CSX. A companion-owned
 worker consumes `sequence.json` only after CSX reports the session complete.
-Windows Imaging Component decodes the PNG frames and Windows Media Foundation
+Windows Imaging Component decodes the lossless BMP or PNG frames and Windows Media Foundation
 encodes H.264 in an MP4 container. Encoding never runs on the render thread,
 source frames are retained, and output is committed only after finalization.
 

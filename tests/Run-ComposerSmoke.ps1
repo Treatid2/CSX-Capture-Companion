@@ -31,8 +31,13 @@ $colors = @(
 )
 
 $manifestFrames = @()
+$formats = @(
+    @{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp },
+    @{ Extension = '.png'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Png },
+    @{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp }
+)
 for ($index = 0; $index -lt $colors.Count; $index++) {
-    $name = 'frame_{0:D9}.png' -f ($index + 1)
+    $name = ('frame_{0:D9}{1}' -f ($index + 1), $formats[$index].Extension)
     foreach ($eyeFrames in @($leftFrames, $rightFrames)) {
         $path = Join-Path $eyeFrames $name
         $bitmap = [System.Drawing.Bitmap]::new(64, 64)
@@ -44,7 +49,7 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
             } finally {
                 $graphics.Dispose()
             }
-            $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bitmap.Save($path, $formats[$index].ImageFormat)
         } finally {
             $bitmap.Dispose()
         }

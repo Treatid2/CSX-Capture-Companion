@@ -9,7 +9,7 @@ render thread never waits for a codec.
 Version 1 uses Windows components already present on normal Skyrim-capable
 systems:
 
-- Windows Imaging Component decodes CSX PNG frames to 32-bit BGRA.
+- Windows Imaging Component decodes CSX lossless BMP or PNG frames to 32-bit BGRA.
 - Windows Media Foundation converts those frames and encodes H.264.
 - Media Foundation's sink writer produces the MP4 container.
 
@@ -37,5 +37,5 @@ second request while queued or encoding is rejected as busy.
 
 Each output is first written as `*.tmp.mp4` beside the frame-set directory. It
 is renamed with write-through semantics only after `IMFSinkWriter::Finalize`
-succeeds. The worker never edits `sequence.json`, never deletes PNG files, and
+succeeds. The worker never edits `sequence.json`, never deletes source frame files, and
 never writes into the Skyrim game directory.

@@ -194,7 +194,7 @@ namespace CSXCaptureCompanion
 			std::vector<std::uint8_t> pixels;
 		};
 
-		DecodedFrame DecodePng(IWICImagingFactory* a_factory, const std::filesystem::path& a_path)
+		DecodedFrame DecodeFrameAsset(IWICImagingFactory* a_factory, const std::filesystem::path& a_path)
 		{
 			ComPtr<IWICBitmapDecoder> decoder;
 			Check(a_factory->CreateDecoderFromFilename(
@@ -267,7 +267,7 @@ namespace CSXCaptureCompanion
 			const StreamPlan& a_plan,
 			const std::filesystem::path& a_outputPath)
 		{
-			const auto first = DecodePng(a_factory, a_plan.frames.front().path);
+			const auto first = DecodeFrameAsset(a_factory, a_plan.frames.front().path);
 			const auto frameRate = EstimateFrameRate(a_plan.frames);
 			const auto pixelsPerSecond =
 				static_cast<std::uint64_t>(first.width) * first.height * frameRate;
@@ -315,7 +315,7 @@ namespace CSXCaptureCompanion
 			const auto firstTimestamp = a_plan.frames.front().timestampUs;
 			std::uint64_t fallbackDurationUs = 1'000'000 / frameRate;
 			for (std::size_t index = 0; index < a_plan.frames.size(); ++index) {
-				auto decoded = index == 0 ? first : DecodePng(a_factory, a_plan.frames[index].path);
+				auto decoded = index == 0 ? first : DecodeFrameAsset(a_factory, a_plan.frames[index].path);
 				if (decoded.width != first.width || decoded.height != first.height) {
 					throw std::runtime_error("Source frame dimensions changed during the sequence.");
 				}
