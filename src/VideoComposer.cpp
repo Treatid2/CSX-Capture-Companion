@@ -270,14 +270,8 @@ namespace CSXCaptureCompanion
 				WICBitmapPaletteTypeCustom),
 				"IWICFormatConverter::Initialize");
 
-			// Media Foundation RGB32 uses a bottom-up positive stride. Flip WIC's
-			// top-down pixels here so the encoded video is upright.
-			ComPtr<IWICBitmapFlipRotator> flip;
-			Check(a_factory->CreateBitmapFlipRotator(flip.GetAddressOf()), "IWICImagingFactory::CreateBitmapFlipRotator");
-			Check(flip->Initialize(converter.Get(), WICBitmapTransformFlipVertical), "IWICBitmapFlipRotator::Initialize");
-
 			DecodedFrame decoded;
-			Check(flip->GetSize(&decoded.width, &decoded.height), "IWICBitmapSource::GetSize");
+			Check(converter->GetSize(&decoded.width, &decoded.height), "IWICBitmapSource::GetSize");
 			if (decoded.width == 0 || decoded.height == 0 ||
 				decoded.width > std::numeric_limits<std::uint32_t>::max() / 4) {
 				throw std::runtime_error("A source frame has invalid dimensions.");
@@ -288,7 +282,9 @@ namespace CSXCaptureCompanion
 				throw std::runtime_error("A source frame is too large for a Media Foundation sample.");
 			}
 			decoded.pixels.resize(static_cast<std::size_t>(bytes));
-			Check(flip->CopyPixels(
+			// WIC returns top-down scan lines. MF_MT_DEFAULT_STRIDE is positive
+			// for top-down images, so pass those rows through unchanged.
+			Check(converter->CopyPixels(
 				nullptr,
 				decoded.stride,
 				static_cast<std::uint32_t>(bytes),

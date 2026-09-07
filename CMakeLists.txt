@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(
     CSXCaptureCompanion
-    VERSION 0.1.0
+    VERSION 0.1.1
     LANGUAGES CXX
 )
 
@@ -107,5 +107,6 @@ if(BUILD_TESTING)
             pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/Run-ComposerSmoke.ps1"
             -Executable "$<TARGET_FILE:CSXCaptureComposerSmoke>"
             -WorkRoot "${CMAKE_CURRENT_BINARY_DIR}/composer-smoke"
+            -AllowedRoot "${CMAKE_CURRENT_BINARY_DIR}"
     )
 endif()

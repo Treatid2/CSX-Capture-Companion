@@ -15,7 +15,7 @@ sets. Audio is outside the first version.
   for asynchronous MP4 composition.
 - MCM toggles install or remove those powers and select Left, Right, or Both eyes.
 
-The 0.1.0 demonstrator requests PNG stills and a bounded 300-frame BMP
+The 0.1.1 demonstrator requests PNG stills and a bounded 300-frame BMP
 sequence sampled every 12 rendered game frames. It uses one eye output or two
 synchronized Left/Right outputs, disables clipboard and CSX preview packaging,
 records backpressure in the manifest, and never starts a second sequence while
@@ -69,7 +69,7 @@ install staging, and ZIP creation:
 & .\tools\Build-Package.ps1
 ```
 
-The resulting archive is `dist\CSXCaptureCompanion-0.1.0.zip`. The deterministic
+The resulting archive is `dist\CSXCaptureCompanion-0.1.1.zip`. The deterministic
 record builder can be run or verified independently:
 
 ```powershell
