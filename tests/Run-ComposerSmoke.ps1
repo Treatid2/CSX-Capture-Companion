@@ -4,15 +4,18 @@ param(
     [string] $Executable,
 
     [Parameter(Mandatory)]
-    [string] $WorkRoot
+    [string] $WorkRoot,
+
+    [Parameter(Mandatory)]
+    [string] $AllowedRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$resolvedBuildRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\build')).TrimEnd('\') + '\'
+$resolvedBuildRoot = [System.IO.Path]::GetFullPath($AllowedRoot).TrimEnd('\') + '\'
 $resolvedWorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (-not $resolvedWorkRoot.StartsWith($resolvedBuildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing to replace composer fixture outside the project build tree: $resolvedWorkRoot"
+    throw "Refusing to replace composer fixture outside the configured build tree: $resolvedWorkRoot"
 }
 if (Test-Path -LiteralPath $resolvedWorkRoot) {
     Remove-Item -LiteralPath $resolvedWorkRoot -Recurse -Force
@@ -46,6 +49,15 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
             try {
                 $colorIndex = if ($eyeFrames -eq $leftFrames) { $index } else { $colors.Count - 1 - $index }
                 $graphics.Clear($colors[$colorIndex])
+                $topBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::White)
+                $bottomBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::Black)
+                try {
+                    $graphics.FillRectangle($topBrush, 0, 0, 64, 16)
+                    $graphics.FillRectangle($bottomBrush, 0, 48, 64, 16)
+                } finally {
+                    $topBrush.Dispose()
+                    $bottomBrush.Dispose()
+                }
             } finally {
                 $graphics.Dispose()
             }

@@ -15,7 +15,7 @@ $dataRoot = Join-Path $projectRoot 'Data'
 $pluginPath = Join-Path $dataRoot 'CSXCaptureCompanion.esp'
 $stageRoot = Join-Path $buildRoot 'package'
 $distRoot = Join-Path $projectRoot 'dist'
-$archivePath = Join-Path $distRoot 'CSXCaptureCompanion-0.1.0.zip'
+$archivePath = Join-Path $distRoot 'CSXCaptureCompanion-0.1.1.zip'
 
 & (Join-Path $PSScriptRoot 'Build-Papyrus.ps1') -ImportPath $PapyrusImportPath
 if ($LASTEXITCODE -ne 0) {
