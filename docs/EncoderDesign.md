@@ -28,7 +28,8 @@ available, the worker reports failure and leaves all lossless inputs untouched.
   therefore remains a visible hold without changing playback speed.
 - A Left or Right session produces one `-left.mp4` or `-right.mp4` file. If that
   name already exists, a numeric suffix preserves the earlier output.
-- A Both session produces paired `-left.mp4` and `-right.mp4` files.
+- A Both session produces one double-width `-sbs.mp4`. The left eye occupies the
+  left half and the right eye occupies the right half.
 - The first written frame establishes dimensions; a later size change fails the
   composition instead of creating a malformed stream.
 - `audio` remains false and no audio stream is created.

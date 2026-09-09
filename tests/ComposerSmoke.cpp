@@ -201,9 +201,33 @@ namespace
 		const auto band = std::max<std::size_t>(1, height / 4);
 		const auto top = average(0, band);
 		const auto bottom = average(height - band, height);
+		if (width != 128 || height != 64) {
+			buffer->Unlock();
+			std::cerr << "Decoded SBS dimensions were " << width << "x" << height << ", expected 128x64.\n";
+			return 8;
+		}
+		auto averageGreen = [&](std::size_t a_beginX, std::size_t a_endX) {
+			std::uint64_t total = 0;
+			std::uint64_t count = 0;
+			for (auto y = band; y < height - band; ++y) {
+				const auto* pixels = row(y);
+				for (auto x = a_beginX; x < a_endX; ++x) {
+					total += pixels[x * 4 + 1];
+					++count;
+				}
+			}
+			return count == 0 ? 0 : static_cast<int>(total / count);
+		};
+		const auto leftGreen = averageGreen(0, width / 2);
+		const auto rightGreen = averageGreen(width / 2, width);
 		buffer->Unlock();
 		if (top <= bottom + 64) {
 			std::cerr << "Decoded orientation check failed: top=" << top << ", bottom=" << bottom << ".\n";
+			return 8;
+		}
+		if (rightGreen <= leftGreen + 64) {
+			std::cerr << "Decoded SBS eye placement failed: left green=" << leftGreen <<
+				", right green=" << rightGreen << ".\n";
 			return 8;
 		}
 
@@ -243,7 +267,8 @@ namespace
 				return 9;
 			}
 		}
-		std::cout << "Decoded orientation verified: top=" << top << ", bottom=" << bottom << ".\n";
+		std::cout << "Decoded SBS verified: top=" << top << ", bottom=" << bottom <<
+			", left green=" << leftGreen << ", right green=" << rightGreen << ".\n";
 		return 0;
 	}
 }

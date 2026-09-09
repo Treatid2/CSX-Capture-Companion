@@ -53,13 +53,15 @@ namespace CSXCaptureCompanion
 
 		struct StreamPlan
 		{
+			std::string view;
 			std::string suffix;
 			std::vector<Frame> frames;
 		};
 
 		struct EncodingPlan
 		{
-			const StreamPlan* stream{};
+			const StreamPlan* primary{};
+			const StreamPlan* secondary{};
 			std::filesystem::path output;
 			std::filesystem::path temporary;
 		};
@@ -299,12 +301,12 @@ namespace CSXCaptureCompanion
 					throw std::runtime_error("The legacy manifest is not complete.");
 				const auto eye = manifest.value("eye", "Left");
 				if (eye == "Both") {
-					plans.push_back({ "left", {} });
-					plans.push_back({ "right", {} });
+					plans.push_back({ "left_eye", "left", {} });
+					plans.push_back({ "right_eye", "right", {} });
 				} else if (eye == "Right") {
-					plans.push_back({ "right", {} });
+					plans.push_back({ "right_eye", "right", {} });
 				} else {
-					plans.push_back({ "left", {} });
+					plans.push_back({ "left_eye", "left", {} });
 				}
 				const auto& frames = manifest.at("frames");
 				if (!frames.is_array() || frames.size() > kMaximumSourceFrames)
@@ -334,9 +336,15 @@ namespace CSXCaptureCompanion
 				if (outputs.size() > kMaximumStreams)
 					throw std::runtime_error("The Screenshot API manifest has too many outputs.");
 				std::set<std::string, std::less<>> suffixes;
+				std::set<std::string, std::less<>> views;
 				for (const auto& output : outputs) {
 					if (!output.is_object())
 						throw std::runtime_error("A Screenshot API output entry is invalid.");
+					if (!output.contains("view") || !output["view"].is_string())
+						throw std::runtime_error("A Screenshot API output has no usable view.");
+					const auto view = output["view"].get<std::string>();
+					if ((view != "left_eye" && view != "right_eye") || !views.insert(view).second)
+						throw std::runtime_error("Video composition requires unique left- or right-eye outputs.");
 					std::string suffix;
 					if (output.contains("nameSuffix")) {
 						if (!output["nameSuffix"].is_string())
@@ -355,7 +363,7 @@ namespace CSXCaptureCompanion
 					});
 					if (!suffixes.insert(comparable).second)
 						throw std::runtime_error("Output suffixes must be unique.");
-					plans.push_back({ std::move(suffix), {} });
+					plans.push_back({ view, std::move(suffix), {} });
 				}
 				const auto& children = manifest.at("children");
 				if (!children.is_array() || children.size() > kMaximumSourceFrames)
@@ -390,14 +398,42 @@ namespace CSXCaptureCompanion
 			const std::filesystem::path& a_sequenceDirectory,
 			const std::vector<StreamPlan>& a_streams)
 		{
+			struct OutputSource
+			{
+				const StreamPlan* primary{};
+				const StreamPlan* secondary{};
+				std::string suffix;
+			};
+
+			std::vector<OutputSource> sources;
+			if (a_streams.size() == 1) {
+				sources.push_back({ &a_streams.front(), nullptr, a_streams.front().suffix });
+			} else {
+				const StreamPlan* left = nullptr;
+				const StreamPlan* right = nullptr;
+				for (const auto& stream : a_streams) {
+					if (stream.view == "left_eye")
+						left = &stream;
+					else if (stream.view == "right_eye")
+						right = &stream;
+				}
+				if (!left || !right || left->frames.size() != right->frames.size())
+					throw std::runtime_error("A stereo sequence requires synchronized left and right eyes.");
+				for (std::size_t index = 0; index < left->frames.size(); ++index) {
+					if (left->frames[index].timestampUs != right->frames[index].timestampUs)
+						throw std::runtime_error("Stereo eye frames have different timestamps.");
+				}
+				sources.push_back({ left, right, "sbs" });
+			}
+
 			const auto outputDirectory = a_sequenceDirectory.parent_path();
 			const auto sequenceName = a_sequenceDirectory.filename().wstring();
 			std::vector<EncodingPlan> result;
 			std::set<std::wstring> reserved;
 			std::uint32_t outputOrdinal = 1;
 			for (; outputOrdinal <= 10'000; ++outputOrdinal) {
-				const auto available = std::ranges::all_of(a_streams, [&](const StreamPlan& a_stream) {
-					const auto baseName = sequenceName + L"-" + Utf8ToWide(a_stream.suffix);
+				const auto available = std::ranges::all_of(sources, [&](const OutputSource& a_source) {
+					const auto baseName = sequenceName + L"-" + Utf8ToWide(a_source.suffix);
 					const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
 					return !std::filesystem::exists(outputDirectory / (baseName + ordinal + L".mp4"));
 				});
@@ -407,8 +443,8 @@ namespace CSXCaptureCompanion
 			if (outputOrdinal > 10'000)
 				throw std::runtime_error("No available video output name could be found.");
 
-			for (const auto& stream : a_streams) {
-				const auto suffix = Utf8ToWide(stream.suffix);
+			for (const auto& source : sources) {
+				const auto suffix = Utf8ToWide(source.suffix);
 				const auto baseName = sequenceName + L"-" + suffix;
 				const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
 				auto output = outputDirectory / (baseName + ordinal + L".mp4");
@@ -430,7 +466,7 @@ namespace CSXCaptureCompanion
 					!reserved.insert(ComparablePath(temporary)).second) {
 					throw std::runtime_error("Video output paths must be unique.");
 				}
-				result.push_back({ &stream, std::move(output), std::move(temporary) });
+				result.push_back({ source.primary, source.secondary, std::move(output), std::move(temporary) });
 			}
 
 			for (const auto& encoding : result) {
@@ -499,6 +535,41 @@ namespace CSXCaptureCompanion
 			return decoded;
 		}
 
+		DecodedFrame DecodeOutputFrame(
+			IWICImagingFactory* a_factory,
+			const EncodingPlan& a_plan,
+			std::size_t a_index)
+		{
+			auto primary = DecodeFrameAsset(a_factory, a_plan.primary->frames.at(a_index).path);
+			if (!a_plan.secondary)
+				return primary;
+
+			auto secondary = DecodeFrameAsset(a_factory, a_plan.secondary->frames.at(a_index).path);
+			if (primary.width != secondary.width || primary.height != secondary.height)
+				throw std::runtime_error("Stereo source eyes have different dimensions.");
+			if (primary.width > std::numeric_limits<std::uint32_t>::max() - secondary.width)
+				throw std::runtime_error("The side-by-side video width is too large.");
+
+			DecodedFrame combined;
+			combined.width = primary.width + secondary.width;
+			combined.height = primary.height;
+			if (combined.width > std::numeric_limits<std::uint32_t>::max() / 4)
+				throw std::runtime_error("The side-by-side video stride is too large.");
+			combined.stride = combined.width * 4;
+			const auto bytes = static_cast<std::uint64_t>(combined.stride) * combined.height;
+			if (bytes > std::numeric_limits<std::uint32_t>::max())
+				throw std::runtime_error("The side-by-side frame is too large for a Media Foundation sample.");
+			combined.pixels.resize(static_cast<std::size_t>(bytes));
+			for (std::uint32_t row = 0; row < combined.height; ++row) {
+				auto* destination = combined.pixels.data() + static_cast<std::size_t>(row) * combined.stride;
+				const auto* left = primary.pixels.data() + static_cast<std::size_t>(row) * primary.stride;
+				const auto* right = secondary.pixels.data() + static_cast<std::size_t>(row) * secondary.stride;
+				std::copy_n(left, primary.stride, destination);
+				std::copy_n(right, secondary.stride, destination + primary.stride);
+			}
+			return combined;
+		}
+
 		void WriteFrameSample(
 			IMFSinkWriter* a_writer,
 			DWORD a_streamIndex,
@@ -523,13 +594,11 @@ namespace CSXCaptureCompanion
 			Check(a_writer->WriteSample(a_streamIndex, sample.Get()), "IMFSinkWriter::WriteSample");
 		}
 
-		void EncodeStream(
-			IWICImagingFactory* a_factory,
-			const StreamPlan& a_plan,
-			const std::filesystem::path& a_outputPath)
+		void EncodeStream(IWICImagingFactory* a_factory, const EncodingPlan& a_plan)
 		{
-			const auto first = DecodeFrameAsset(a_factory, a_plan.frames.front().path);
-			const auto frameRate = EstimateFrameRate(a_plan.frames);
+			const auto first = DecodeOutputFrame(a_factory, a_plan, 0);
+			const auto& timeline = a_plan.primary->frames;
+			const auto frameRate = EstimateFrameRate(timeline);
 			const auto pixelsPerSecond =
 				static_cast<std::uint64_t>(first.width) * first.height * frameRate;
 			const auto bitrate64 = std::clamp<std::uint64_t>(pixelsPerSecond / 8, 4'000'000, 50'000'000);
@@ -542,7 +611,7 @@ namespace CSXCaptureCompanion
 
 			ComPtr<IMFSinkWriter> writer;
 			Check(MFCreateSinkWriterFromURL(
-				a_outputPath.c_str(),
+				a_plan.temporary.c_str(),
 				nullptr,
 				attributes.Get(),
 				writer.GetAddressOf()),
@@ -573,16 +642,16 @@ namespace CSXCaptureCompanion
 			Check(writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr), "IMFSinkWriter::SetInputMediaType");
 			Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
 
-			const auto firstTimestamp = a_plan.frames.front().timestampUs;
+			const auto firstTimestamp = timeline.front().timestampUs;
 			const auto sampleDuration = static_cast<LONGLONG>(10'000'000 / frameRate);
 			std::uint64_t previousTick = 0;
 			DecodedFrame previousFrame = first;
-			for (std::size_t index = 0; index < a_plan.frames.size(); ++index) {
-				auto decoded = index == 0 ? first : DecodeFrameAsset(a_factory, a_plan.frames[index].path);
+			for (std::size_t index = 0; index < timeline.size(); ++index) {
+				auto decoded = index == 0 ? first : DecodeOutputFrame(a_factory, a_plan, index);
 				if (decoded.width != first.width || decoded.height != first.height) {
 					throw std::runtime_error("Source frame dimensions changed during the sequence.");
 				}
-				const auto tick = TimestampToTick(a_plan.frames[index].timestampUs - firstTimestamp, frameRate);
+				const auto tick = TimestampToTick(timeline[index].timestampUs - firstTimestamp, frameRate);
 				for (auto missingTick = previousTick + 1; index > 0 && missingTick < tick; ++missingTick) {
 					WriteFrameSample(writer.Get(), streamIndex, previousFrame,
 						static_cast<LONGLONG>(missingTick) * sampleDuration, sampleDuration);
@@ -674,7 +743,7 @@ namespace CSXCaptureCompanion
 			for (const auto& encoding : encodings) {
 				if (std::filesystem::exists(encoding.temporary))
 					throw std::runtime_error("The selected temporary video path is no longer available.");
-				EncodeStream(factory.Get(), *encoding.stream, encoding.temporary);
+				EncodeStream(factory.Get(), encoding);
 				if (!MoveFileExW(
 						encoding.temporary.c_str(),
 						encoding.output.c_str(),

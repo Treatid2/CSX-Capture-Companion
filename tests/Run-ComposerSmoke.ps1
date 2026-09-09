@@ -48,8 +48,9 @@ function Write-TestManifest {
 			error = $null
 		}
 	}
-	$outputs = foreach ($suffix in $Suffixes) {
-		[ordered]@{ view = 'left_eye'; nameSuffix = $suffix }
+	$outputs = for ($index = 0; $index -lt $Suffixes.Count; $index++) {
+		$view = if ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
+		[ordered]@{ view = $view; nameSuffix = $Suffixes[$index] }
 	}
 	$document = [ordered]@{
 		contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
@@ -155,7 +156,7 @@ $sourceHashes = @{}
 foreach ($source in $sourceFiles) {
 	$sourceHashes[$source.FullName] = (Get-FileHash -LiteralPath $source.FullName -Algorithm SHA256).Hash
 }
-$oldPredictableTemporary = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-left.tmp.mp4'
+$oldPredictableTemporary = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs.tmp.mp4'
 Set-Content -LiteralPath $oldPredictableTemporary -Value 'unrelated pre-existing file' -Encoding ascii -NoNewline
 $oldTemporaryHash = (Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash
 
@@ -164,23 +165,26 @@ if ($LASTEXITCODE -ne 0) {
     throw "Composer smoke executable failed with exit code $LASTEXITCODE."
 }
 
-foreach ($suffix in @('left', 'right')) {
-    $output = Join-Path $resolvedWorkRoot "CS_sequence_smoke_1-$suffix.mp4"
-    if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
-        throw "Composer did not produce $output"
-    }
-    $artifact = Get-Item -LiteralPath $output
-    if ($artifact.Length -le 0) {
-        throw "Composer produced an empty $suffix-eye MP4."
-    }
-    [pscustomobject]@{
-        Path = $artifact.FullName
-        Bytes = $artifact.Length
-        SHA256 = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    }
-	& $Executable --verify-orientation $output
-	if ($LASTEXITCODE -ne 0) {
-		throw "Decoded orientation verification failed for $output."
+$output = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs.mp4'
+if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
+	throw "Composer did not produce $output"
+}
+$artifact = Get-Item -LiteralPath $output
+if ($artifact.Length -le 0) {
+	throw 'Composer produced an empty side-by-side MP4.'
+}
+[pscustomobject]@{
+	Path = $artifact.FullName
+	Bytes = $artifact.Length
+	SHA256 = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+& $Executable --verify-orientation $output
+if ($LASTEXITCODE -ne 0) {
+	throw "Decoded SBS verification failed for $output."
+}
+foreach ($monoOutput in @('CS_sequence_smoke_1-left.mp4', 'CS_sequence_smoke_1-right.mp4')) {
+	if (Test-Path -LiteralPath (Join-Path $resolvedWorkRoot $monoOutput)) {
+		throw "Stereo composition unexpectedly produced a mono output: $monoOutput"
 	}
 }
 
@@ -191,6 +195,10 @@ if ((Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash 
 & $Executable --race $sequence
 if ($LASTEXITCODE -ne 0) {
 	throw "Concurrent composer admission test failed with exit code $LASTEXITCODE."
+}
+$numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
+if (-not (Test-Path -LiteralPath $numberedOutput -PathType Leaf)) {
+	throw 'Concurrent composition did not preserve the original SBS output with a numbered filename.'
 }
 
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
@@ -257,7 +265,7 @@ foreach ($source in $sourceFiles) {
 
 $unexpectedOutputs = @(
 	'CS_sequence_unsafe-left.mp4',
-	'CS_sequence_duplicate-left.mp4',
+	'CS_sequence_duplicate-sbs.mp4',
 	'CS_sequence_too_many_outputs-left.mp4',
 	'CS_sequence_uncommitted-left.mp4',
 	'CS_sequence_duplicate_time-left.mp4',
