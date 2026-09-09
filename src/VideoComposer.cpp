@@ -56,6 +56,14 @@ namespace CSXCaptureCompanion
 			std::string view;
 			std::string suffix;
 			std::vector<Frame> frames;
+			std::vector<std::uint64_t> scheduledTimestampsUs;
+		};
+
+		struct TimelinePlan
+		{
+			std::uint32_t frameRate{};
+			std::vector<std::uint64_t> frameTicks;
+			std::uint64_t finalTick{};
 		};
 
 		struct EncodingPlan
@@ -64,6 +72,7 @@ namespace CSXCaptureCompanion
 			const StreamPlan* secondary{};
 			std::filesystem::path output;
 			std::filesystem::path temporary;
+			TimelinePlan timeline;
 		};
 
 		constexpr std::uintmax_t kMaximumManifestBytes = 16 * 1024 * 1024;
@@ -188,7 +197,7 @@ namespace CSXCaptureCompanion
 		std::uint64_t ReadTimestamp(const json& a_object, std::string_view a_name)
 		{
 			if (!a_object.is_object() || !a_object.contains(a_name) || !a_object[a_name].is_number_unsigned())
-				throw std::runtime_error("A completed frame has an invalid timestamp.");
+				throw std::runtime_error("A sequence frame has an invalid timestamp.");
 			return a_object[a_name].get<std::uint64_t>();
 		}
 
@@ -204,19 +213,19 @@ namespace CSXCaptureCompanion
 			});
 		}
 
-		std::uint32_t EstimateFrameRate(const std::vector<Frame>& a_frames)
+		std::uint32_t EstimateFrameRate(const std::vector<std::uint64_t>& a_timestamps)
 		{
 			std::vector<std::uint64_t> intervals;
-			for (std::size_t index = 1; index < a_frames.size(); ++index) {
-				if (a_frames[index].timestampUs > a_frames[index - 1].timestampUs)
-					intervals.push_back(a_frames[index].timestampUs - a_frames[index - 1].timestampUs);
+			for (std::size_t index = 1; index < a_timestamps.size(); ++index) {
+				intervals.push_back(a_timestamps[index] - a_timestamps[index - 1]);
 			}
 			if (intervals.empty())
 				return 60;
 			const auto middle = intervals.begin() + static_cast<std::ptrdiff_t>(intervals.size() / 2);
 			std::nth_element(intervals.begin(), middle, intervals.end());
 			const auto interval = std::max<std::uint64_t>(*middle, 1);
-			return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(1'000'000 / interval, 1, 120));
+			const auto roundedRate = (1'000'000 + interval / 2) / interval;
+			return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(roundedRate, 1, 120));
 		}
 
 		std::uint64_t TimestampToTick(std::uint64_t a_normalizedUs, std::uint32_t a_frameRate)
@@ -226,13 +235,22 @@ namespace CSXCaptureCompanion
 			return wholeSeconds * a_frameRate + (remainingUs * a_frameRate + 500'000) / 1'000'000;
 		}
 
-		void ValidateTimeline(const StreamPlan& a_plan)
+		TimelinePlan BuildTimeline(const StreamPlan& a_plan)
 		{
 			constexpr auto maximumMicroseconds =
 				static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()) / 10;
+			if (a_plan.scheduledTimestampsUs.empty())
+				throw std::runtime_error("The sequence contains no scheduled frame timestamps.");
+			for (std::size_t index = 1; index < a_plan.scheduledTimestampsUs.size(); ++index) {
+				const auto previous = a_plan.scheduledTimestampsUs[index - 1];
+				const auto timestamp = a_plan.scheduledTimestampsUs[index];
+				if (timestamp <= previous)
+					throw std::runtime_error("Scheduled frame timestamps must be strictly increasing.");
+				if (timestamp - previous > maximumMicroseconds)
+					throw std::runtime_error("A scheduled frame duration is outside the supported range.");
+			}
+
 			const auto firstTimestamp = a_plan.frames.front().timestampUs;
-			const auto frameRate = EstimateFrameRate(a_plan.frames);
-			std::uint64_t previousTick = 0;
 			for (std::size_t index = 0; index < a_plan.frames.size(); ++index) {
 				const auto timestamp = a_plan.frames[index].timestampUs;
 				if (timestamp < firstTimestamp || timestamp - firstTimestamp > maximumMicroseconds)
@@ -244,13 +262,43 @@ namespace CSXCaptureCompanion
 					if (timestamp - previous > maximumMicroseconds)
 						throw std::runtime_error("A frame duration is outside the supported Media Foundation range.");
 				}
-				const auto tick = TimestampToTick(timestamp - firstTimestamp, frameRate);
-				if (tick >= kMaximumSourceFrames)
-					throw std::runtime_error("The manifest timeline would produce too many video samples.");
-				if (index > 0 && tick <= previousTick)
-					throw std::runtime_error("Frame timestamps are too close for the selected video cadence.");
-				previousTick = tick;
+				if (!std::binary_search(
+						a_plan.scheduledTimestampsUs.begin(), a_plan.scheduledTimestampsUs.end(), timestamp)) {
+					throw std::runtime_error("A written frame timestamp is absent from the scheduled timeline.");
+				}
 			}
+
+			auto firstRelevant = std::lower_bound(
+				a_plan.scheduledTimestampsUs.begin(), a_plan.scheduledTimestampsUs.end(), firstTimestamp);
+			auto frameRate = EstimateFrameRate(a_plan.scheduledTimestampsUs);
+			for (; frameRate <= 120; ++frameRate) {
+				bool distinct = true;
+				std::uint64_t previousTick = 0;
+				for (auto timestamp = firstRelevant; timestamp != a_plan.scheduledTimestampsUs.end(); ++timestamp) {
+					const auto tick = TimestampToTick(*timestamp - firstTimestamp, frameRate);
+					if (timestamp != firstRelevant && tick <= previousTick) {
+						distinct = false;
+						break;
+					}
+					previousTick = tick;
+				}
+				if (distinct)
+					break;
+			}
+			if (frameRate > 120)
+				throw std::runtime_error("Frame timestamps are too close for the supported video cadence.");
+
+			TimelinePlan result;
+			result.frameRate = frameRate;
+			result.finalTick = TimestampToTick(
+				a_plan.scheduledTimestampsUs.back() - firstTimestamp, frameRate);
+			if (result.finalTick >= kMaximumSourceFrames)
+				throw std::runtime_error("The manifest timeline would produce too many video samples.");
+			result.frameTicks.reserve(a_plan.frames.size());
+			for (const auto& frame : a_plan.frames) {
+				result.frameTicks.push_back(TimestampToTick(frame.timestampUs - firstTimestamp, frameRate));
+			}
+			return result;
 		}
 
 		std::wstring ComparablePath(const std::filesystem::path& a_path)
@@ -301,20 +349,22 @@ namespace CSXCaptureCompanion
 					throw std::runtime_error("The legacy manifest is not complete.");
 				const auto eye = manifest.value("eye", "Left");
 				if (eye == "Both") {
-					plans.push_back({ "left_eye", "left", {} });
-					plans.push_back({ "right_eye", "right", {} });
+					plans.push_back({ "left_eye", "left", {}, {} });
+					plans.push_back({ "right_eye", "right", {}, {} });
 				} else if (eye == "Right") {
-					plans.push_back({ "right_eye", "right", {} });
+					plans.push_back({ "right_eye", "right", {}, {} });
 				} else {
-					plans.push_back({ "left_eye", "left", {} });
+					plans.push_back({ "left_eye", "left", {}, {} });
 				}
 				const auto& frames = manifest.at("frames");
 				if (!frames.is_array() || frames.size() > kMaximumSourceFrames)
 					throw std::runtime_error("The legacy manifest contains too many frame records.");
 				for (const auto& entry : frames) {
+					const auto timestamp = ReadTimestamp(entry, "timestampUs");
+					for (auto& plan : plans)
+						plan.scheduledTimestampsUs.push_back(timestamp);
 					if (!entry.value("written", false))
 						continue;
-					const auto timestamp = ReadTimestamp(entry, "timestampUs");
 					const auto& paths = entry.at("paths");
 					if (!paths.is_array() || paths.size() != plans.size())
 						throw std::runtime_error("A written frame has the wrong number of eye paths.");
@@ -363,16 +413,20 @@ namespace CSXCaptureCompanion
 					});
 					if (!suffixes.insert(comparable).second)
 						throw std::runtime_error("Output suffixes must be unique.");
-					plans.push_back({ view, std::move(suffix), {} });
+					plans.push_back({ view, std::move(suffix), {}, {} });
 				}
 				const auto& children = manifest.at("children");
 				if (!children.is_array() || children.size() > kMaximumSourceFrames)
 					throw std::runtime_error("The Screenshot API manifest contains too many child records.");
 				for (const auto& child : children) {
-					const auto state = child.value("state", std::string{});
+					if (!child.is_object() || !child.contains("state") || !child["state"].is_string())
+						throw std::runtime_error("A sequence child has an invalid state.");
+					const auto state = child["state"].get<std::string>();
+					const auto timestamp = ReadTimestamp(child, "scheduledTimestampUs");
+					for (auto& plan : plans)
+						plan.scheduledTimestampsUs.push_back(timestamp);
 					if (state != "completed" && state != "completed_with_warnings")
 						continue;
-					const auto timestamp = ReadTimestamp(child, "scheduledTimestampUs");
 					const auto& artifacts = child.at("artifacts");
 					if (!artifacts.is_array() || artifacts.size() != plans.size())
 						throw std::runtime_error("A completed frame has the wrong number of output artifacts.");
@@ -389,7 +443,6 @@ namespace CSXCaptureCompanion
 				if (plan.frames.empty()) {
 					throw std::runtime_error("The sequence contains no written frames to compose.");
 				}
-				ValidateTimeline(plan);
 			}
 			return plans;
 		}
@@ -403,11 +456,13 @@ namespace CSXCaptureCompanion
 				const StreamPlan* primary{};
 				const StreamPlan* secondary{};
 				std::string suffix;
+				TimelinePlan timeline;
 			};
 
 			std::vector<OutputSource> sources;
 			if (a_streams.size() == 1) {
-				sources.push_back({ &a_streams.front(), nullptr, a_streams.front().suffix });
+				sources.push_back({
+					&a_streams.front(), nullptr, a_streams.front().suffix, BuildTimeline(a_streams.front()) });
 			} else {
 				const StreamPlan* left = nullptr;
 				const StreamPlan* right = nullptr;
@@ -417,13 +472,15 @@ namespace CSXCaptureCompanion
 					else if (stream.view == "right_eye")
 						right = &stream;
 				}
-				if (!left || !right || left->frames.size() != right->frames.size())
+				if (!left || !right || left->frames.size() != right->frames.size() ||
+					left->scheduledTimestampsUs != right->scheduledTimestampsUs) {
 					throw std::runtime_error("A stereo sequence requires synchronized left and right eyes.");
+				}
 				for (std::size_t index = 0; index < left->frames.size(); ++index) {
 					if (left->frames[index].timestampUs != right->frames[index].timestampUs)
 						throw std::runtime_error("Stereo eye frames have different timestamps.");
 				}
-				sources.push_back({ left, right, "sbs" });
+				sources.push_back({ left, right, "sbs", BuildTimeline(*left) });
 			}
 
 			const auto outputDirectory = a_sequenceDirectory.parent_path();
@@ -466,7 +523,8 @@ namespace CSXCaptureCompanion
 					!reserved.insert(ComparablePath(temporary)).second) {
 					throw std::runtime_error("Video output paths must be unique.");
 				}
-				result.push_back({ source.primary, source.secondary, std::move(output), std::move(temporary) });
+				result.push_back({
+					source.primary, source.secondary, std::move(output), std::move(temporary), source.timeline });
 			}
 
 			for (const auto& encoding : result) {
@@ -598,7 +656,7 @@ namespace CSXCaptureCompanion
 		{
 			const auto first = DecodeOutputFrame(a_factory, a_plan, 0);
 			const auto& timeline = a_plan.primary->frames;
-			const auto frameRate = EstimateFrameRate(timeline);
+			const auto frameRate = a_plan.timeline.frameRate;
 			const auto pixelsPerSecond =
 				static_cast<std::uint64_t>(first.width) * first.height * frameRate;
 			const auto bitrate64 = std::clamp<std::uint64_t>(pixelsPerSecond / 8, 4'000'000, 50'000'000);
@@ -642,7 +700,6 @@ namespace CSXCaptureCompanion
 			Check(writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr), "IMFSinkWriter::SetInputMediaType");
 			Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
 
-			const auto firstTimestamp = timeline.front().timestampUs;
 			const auto sampleDuration = static_cast<LONGLONG>(10'000'000 / frameRate);
 			std::uint64_t previousTick = 0;
 			DecodedFrame previousFrame = first;
@@ -651,7 +708,7 @@ namespace CSXCaptureCompanion
 				if (decoded.width != first.width || decoded.height != first.height) {
 					throw std::runtime_error("Source frame dimensions changed during the sequence.");
 				}
-				const auto tick = TimestampToTick(timeline[index].timestampUs - firstTimestamp, frameRate);
+				const auto tick = a_plan.timeline.frameTicks[index];
 				for (auto missingTick = previousTick + 1; index > 0 && missingTick < tick; ++missingTick) {
 					WriteFrameSample(writer.Get(), streamIndex, previousFrame,
 						static_cast<LONGLONG>(missingTick) * sampleDuration, sampleDuration);
@@ -660,6 +717,10 @@ namespace CSXCaptureCompanion
 					static_cast<LONGLONG>(tick) * sampleDuration, sampleDuration);
 				previousTick = tick;
 				previousFrame = std::move(decoded);
+			}
+			for (auto trailingTick = previousTick + 1; trailingTick <= a_plan.timeline.finalTick; ++trailingTick) {
+				WriteFrameSample(writer.Get(), streamIndex, previousFrame,
+					static_cast<LONGLONG>(trailingTick) * sampleDuration, sampleDuration);
 			}
 
 			Check(writer->Finalize(), "IMFSinkWriter::Finalize");

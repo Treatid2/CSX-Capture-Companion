@@ -21,14 +21,16 @@ namespace CSXCaptureCompanion
 
 		std::int32_t CaptureStateCode(std::string_view a_state)
 		{
-			if (a_state == "stop_requested" || a_state == "finalizing")
+			if (a_state == "stop_requested" || a_state == "cancel_requested" || a_state == "finalizing")
 				return 2;
 			if (a_state == "completed" || a_state == "completed_with_warnings" || a_state == "stopped")
 				return 3;
 			if (a_state == "failed" || a_state == "failed_partial" || a_state == "rejected" ||
 				a_state == "cancelled" || a_state == "cancelled_partial" || a_state == "dropped")
 				return 4;
-			return a_state.empty() ? 0 : 1;
+			return a_state == "accepted" || a_state == "waiting_source" ||
+			       a_state == "staged" || a_state == "queued" ||
+			       a_state == "encoding" || a_state == "running" ? 1 : -1;
 		}
 
 		bool TryDecodeReceipt(
@@ -51,6 +53,8 @@ namespace CSXCaptureCompanion
 				}
 
 				a_state = receipt["state"].get<std::string>();
+				if (CaptureStateCode(a_state) < 0)
+					return false;
 				a_hasManifest = false;
 				if (receipt.contains("manifest")) {
 					const auto& manifest = receipt["manifest"];

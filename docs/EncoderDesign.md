@@ -23,9 +23,12 @@ available, the worker reports failure and leaves all lossless inputs untouched.
   Foundation sample times.
 - Timestamps must be unsigned, strictly increasing, and representable by Media
   Foundation. Invalid timelines fail before an output is created.
-- The encoder maps source timestamps to a bounded constant-rate cadence and
-  duplicates the preceding image across missing cadence slots. A dropped frame
-  therefore remains a visible hold without changing playback speed.
+- The encoder starts with the rounded median scheduled cadence and raises it,
+  up to 120 fps, until every recorded slot has a distinct sample position.
+  Timelines that cannot fit the 60,000-sample bound are rejected.
+- Missing interior and trailing slots duplicate the preceding image. The final
+  scheduled slot receives one complete sample interval, so recorded trailing
+  drops remain visible without shortening playback.
 - A Left or Right session produces one `-left.mp4` or `-right.mp4` file. If that
   name already exists, a numeric suffix preserves the earlier output.
 - A Both session produces one double-width `-sbs.mp4`. The left eye occupies the

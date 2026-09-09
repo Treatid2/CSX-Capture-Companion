@@ -27,21 +27,29 @@ function Write-TestManifest {
 		[Parameter(Mandatory)] [string[]] $Suffixes,
 		[Parameter(Mandatory)] [object[]] $Timestamps,
 		[Parameter(Mandatory)] [string[]] $ArtifactPaths,
+		[string[]] $States = @(),
 		[bool] $Committed = $true
 	)
 	if ($Suffixes.Count -ne $ArtifactPaths.Count) {
 		throw 'Each test output must have one artifact path.'
 	}
+	if ($States.Count -ne 0 -and $States.Count -ne $Timestamps.Count) {
+		throw 'Each explicitly stated test child must have one timestamp.'
+	}
 	New-Item -ItemType Directory -Force -Path $Sequence | Out-Null
 	$children = @()
 	for ($index = 0; $index -lt $Timestamps.Count; $index++) {
-		$artifacts = foreach ($path in $ArtifactPaths) {
-			[ordered]@{ path = $path; committed = $Committed }
+		$state = if ($States.Count -eq 0) { 'completed' } else { $States[$index] }
+		$artifacts = @()
+		if ($state -eq 'completed' -or $state -eq 'completed_with_warnings') {
+			$artifacts = foreach ($path in $ArtifactPaths) {
+				[ordered]@{ path = $path; committed = $Committed }
+			}
 		}
 		$children += [ordered]@{
 			ordinal = $index + 1
 			requestId = "fixture-frame-$($index + 1)"
-			state = 'completed'
+			state = $state
 			scheduledEngineFrame = [uint64](200 + $index)
 			scheduledTimestampUs = $Timestamps[$index]
 			artifacts = @($artifacts)
@@ -52,6 +60,8 @@ function Write-TestManifest {
 		$view = if ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
 		[ordered]@{ view = $view; nameSuffix = $Suffixes[$index] }
 	}
+	$written = @($children | Where-Object { $_.state -eq 'completed' -or $_.state -eq 'completed_with_warnings' }).Count
+	$dropped = @($children | Where-Object { $_.state -eq 'dropped' }).Count
 	$document = [ordered]@{
 		contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
 		sessionId = 'fixture-session'
@@ -59,7 +69,7 @@ function Write-TestManifest {
 		state = 'final'
 		capture = [ordered]@{ outputs = @($outputs) }
 		updatedUtc = '2026-09-09T00:00:00.000Z'
-		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; written = $Timestamps.Count; dropped = 0; failed = 0; inFlight = 0 }
+		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; written = $written; dropped = $dropped; failed = 0; inFlight = 0 }
 		children = $children
 	}
 	$document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Sequence 'sequence.json') -Encoding utf8NoBOM
@@ -70,6 +80,25 @@ function Invoke-ExpectedFailure {
 	& $Executable --expect-failure $Sequence
 	if ($LASTEXITCODE -ne 0) {
 		throw "Composer did not safely reject fixture $Sequence (exit $LASTEXITCODE)."
+	}
+}
+
+function Invoke-CompositionWithSampleCount {
+	param(
+		[Parameter(Mandatory)] [string] $Sequence,
+		[Parameter(Mandatory)] [string] $Output,
+		[Parameter(Mandatory)] [int] $ExpectedCount
+	)
+	& $Executable $Sequence
+	if ($LASTEXITCODE -ne 0) {
+		throw "Composer rejected valid fixture $Sequence (exit $LASTEXITCODE)."
+	}
+	if (-not (Test-Path -LiteralPath $Output -PathType Leaf)) {
+		throw "Composer did not produce $Output"
+	}
+	& $Executable --verify-sample-count $ExpectedCount $Output
+	if ($LASTEXITCODE -ne 0) {
+		throw "Decoded sample-count verification failed for $Output."
 	}
 }
 
@@ -133,6 +162,18 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
 		error = $null
 	}
 }
+foreach ($offset in @([uint64]83335, [uint64]100002)) {
+	$ordinal = $manifestChildren.Count + 1
+	$manifestChildren += [ordered]@{
+		ordinal = $ordinal
+		requestId = "smoke-frame-$ordinal"
+		state = 'dropped'
+		scheduledEngineFrame = [uint64](100 + (($ordinal - 1) * 12))
+		scheduledTimestampUs = [uint64](1000000 + $offset)
+		artifacts = @()
+		error = [ordered]@{ code = 'encoder_backpressure'; message = 'fixture drop' }
+	}
+}
 
 $manifest = [ordered]@{
 	contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
@@ -146,7 +187,7 @@ $manifest = [ordered]@{
 		)
 	}
     updatedUtc = '2026-08-24T00:00:01.000Z'
-	counts = [ordered]@{ requested = 3; scheduled = 3; written = 3; dropped = 0; failed = 0; inFlight = 0 }
+	counts = [ordered]@{ requested = 6; scheduled = 6; written = 4; dropped = 2; failed = 0; inFlight = 0 }
 	children = $manifestChildren
 }
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $sequence 'sequence.json') -Encoding utf8NoBOM
@@ -204,6 +245,65 @@ if (-not (Test-Path -LiteralPath $numberedOutput -PathType Leaf)) {
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
 $rightSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $rightFrames } | Select-Object -First 1
 
+$longSequence = Join-Path $resolvedWorkRoot 'CS_sequence_long_cadence'
+$longTimestamps = @(
+	for ($index = 0; $index -lt 300; $index++) {
+		[uint64](2000000 + ($index * 16667))
+	}
+)
+Write-TestManifest -Sequence $longSequence -Suffixes @('left') -Timestamps $longTimestamps -ArtifactPaths @($leftSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $longSequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_long_cadence-left.mp4') -ExpectedCount 300
+
+$jitterSequence = Join-Path $resolvedWorkRoot 'CS_sequence_jitter_cadence'
+$jitterTimestamps = [System.Collections.Generic.List[object]]::new()
+$jitterTimestamp = [uint64]2500000
+for ($index = 0; $index -lt 120; $index++) {
+	$jitterTimestamps.Add($jitterTimestamp)
+	if (($index % 2) -eq 0) {
+		$jitterTimestamp += [uint64]16600
+	} else {
+		$jitterTimestamp += [uint64]16734
+	}
+}
+Write-TestManifest -Sequence $jitterSequence -Suffixes @('left') -Timestamps $jitterTimestamps.ToArray() -ArtifactPaths @($leftSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $jitterSequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_jitter_cadence-left.mp4') -ExpectedCount 120
+
+$fractionalSequence = Join-Path $resolvedWorkRoot 'CS_sequence_fractional_cadence'
+$fractionalTimestamps = @(
+	[uint64]3000000,
+	[uint64]3133333,
+	[uint64]3266667,
+	[uint64]3400000,
+	[uint64]3533333,
+	[uint64]3666667,
+	[uint64]3800000,
+	[uint64]3933333,
+	[uint64]4066667
+)
+Write-TestManifest -Sequence $fractionalSequence -Suffixes @('left') -Timestamps $fractionalTimestamps -ArtifactPaths @($leftSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $fractionalSequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_fractional_cadence-left.mp4') -ExpectedCount 10
+
+$trailingSequence = Join-Path $resolvedWorkRoot 'CS_sequence_single_tail'
+Write-TestManifest -Sequence $trailingSequence -Suffixes @('left') `
+	-Timestamps @([uint64]4000000, [uint64]4020000, [uint64]4040000) `
+	-ArtifactPaths @($leftSource.FullName) -States @('completed', 'dropped', 'dropped')
+Invoke-CompositionWithSampleCount -Sequence $trailingSequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_single_tail-left.mp4') -ExpectedCount 3
+
+$legacySequence = Join-Path $resolvedWorkRoot 'CS_sequence_legacy_tail'
+New-Item -ItemType Directory -Force -Path $legacySequence | Out-Null
+$legacyManifest = [ordered]@{
+	schema = 'csx.frame-sequence/1'
+	state = 'complete'
+	eye = 'Left'
+	frames = @(
+		[ordered]@{ timestampUs = [uint64]5000000; written = $true; paths = @($leftSource.FullName) },
+		[ordered]@{ timestampUs = [uint64]5020000; written = $false; paths = @() },
+		[ordered]@{ timestampUs = [uint64]5040000; written = $false; paths = @() }
+	)
+}
+$legacyManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $legacySequence 'sequence.json') -Encoding utf8NoBOM
+Invoke-CompositionWithSampleCount -Sequence $legacySequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_legacy_tail-left.mp4') -ExpectedCount 3
+
 $unsafeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unsafe'
 Write-TestManifest -Sequence $unsafeSequence -Suffixes @('../outside') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
 Invoke-ExpectedFailure -Sequence $unsafeSequence
@@ -240,6 +340,18 @@ $overflowTimeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_overflow_time'
 Write-TestManifest -Sequence $overflowTimeSequence -Suffixes @('left') -Timestamps @([uint64]0, [uint64]922337203685477581) -ArtifactPaths @($leftSource.FullName)
 Invoke-ExpectedFailure -Sequence $overflowTimeSequence
 
+$invalidTailSequence = Join-Path $resolvedWorkRoot 'CS_sequence_invalid_tail'
+Write-TestManifest -Sequence $invalidTailSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000, [int64]-1) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', 'dropped')
+Invoke-ExpectedFailure -Sequence $invalidTailSequence
+
+$overflowTailSequence = Join-Path $resolvedWorkRoot 'CS_sequence_overflow_tail'
+Write-TestManifest -Sequence $overflowTailSequence -Suffixes @('left') `
+	-Timestamps @([uint64]0, [uint64]922337203685477581) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', 'dropped')
+Invoke-ExpectedFailure -Sequence $overflowTailSequence
+
 $aliasSequence = Join-Path $resolvedWorkRoot 'CS_sequence_alias'
 $aliasSource = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left.mp4'
 Copy-Item -LiteralPath $leftSource.FullName -Destination $aliasSource
@@ -272,7 +384,9 @@ $unexpectedOutputs = @(
 	'CS_sequence_decreasing_time-left.mp4',
 	'CS_sequence_negative_time-left.mp4',
 	'CS_sequence_fractional_time-left.mp4',
-	'CS_sequence_overflow_time-left.mp4'
+	'CS_sequence_overflow_time-left.mp4',
+	'CS_sequence_invalid_tail-left.mp4',
+	'CS_sequence_overflow_tail-left.mp4'
 )
 foreach ($name in $unexpectedOutputs) {
 	if (Test-Path -LiteralPath (Join-Path $resolvedWorkRoot $name)) {

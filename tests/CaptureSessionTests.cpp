@@ -32,6 +32,8 @@ namespace
 			{ { "ok", true }, { "result", 7 } },
 			{ { "ok", true }, { "result", { { "requestId", 9 }, { "state", "active" } } } },
 			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", 9 } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "" } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "future_state" } } } },
 			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", json::object() } } } },
 		};
 
@@ -51,6 +53,41 @@ namespace
 			passed &= Check(session.ActiveRequestId() == "A", "Malformed receipt changed active request ownership.");
 		}
 		return passed;
+	}
+
+	bool TestUnusableStopReceipt()
+	{
+		std::atomic_int starts{ 0 };
+		CaptureSession session([&](json request) {
+			const auto action = request.at("action").get<std::string>();
+			if (action == "sequence_start") {
+				return json{
+					{ "ok", true }, { "result", { { "requestId", ++starts == 1 ? "seed" : "A" } } } };
+			}
+			if (action == "request_get") {
+				if (request.at("requestId") == "seed") {
+					return json{
+						{ "ok", true },
+						{ "result", {
+							{ "requestId", "seed" },
+							{ "state", "completed" },
+							{ "manifest", { { "finalPath", "D:/captures/seed/sequence.json" } } },
+						} },
+					};
+				}
+				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "running" } } } };
+			}
+			return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "" } } } };
+		});
+
+		return Check(session.Toggle(StartRequest()), "Could not establish the seed capture state.") &&
+		       Check(session.Refresh() == 3, "Could not retain the seed capture manifest.") &&
+		       Check(session.Toggle(StartRequest()), "Could not establish the unusable-stop fixture state.") &&
+		       Check(!session.Toggle(StartRequest()), "An empty stop state was reported as successful.") &&
+		       Check(session.ActiveRequestId() == "A", "An empty stop state changed active request ownership.") &&
+		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/seed/sequence.json"),
+			       "An empty stop state replaced the latest valid manifest.") &&
+		       Check(session.Refresh() == 1, "An empty stop state replaced the last valid capture state.");
 	}
 
 	bool TestAcceptedRequestReplies()
@@ -84,7 +121,7 @@ namespace
 				return json{ { "ok", true }, { "result", { { "requestId", "A" } } } };
 			}
 			if (action == "request_get")
-				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "capturing" } } } };
+				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "running" } } } };
 			++stops;
 			return json{
 				{ "ok", true },
@@ -171,6 +208,7 @@ namespace
 int main()
 {
 	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
-	                    TestConcurrentToggle() && TestRefreshThenSuccessorStart();
+	                    TestUnusableStopReceipt() && TestConcurrentToggle() &&
+	                    TestRefreshThenSuccessorStart();
 	return passed ? 0 : 1;
 }
