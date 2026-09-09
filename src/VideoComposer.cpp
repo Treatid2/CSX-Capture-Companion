@@ -201,6 +201,20 @@ namespace CSXCaptureCompanion
 			return a_object[a_name].get<std::uint64_t>();
 		}
 
+		bool IsWrittenChildState(std::string_view a_state)
+		{
+			return a_state == "completed" || a_state == "completed_with_warnings";
+		}
+
+		bool IsMissingChildState(std::string_view a_state)
+		{
+			// Final manifests admit terminal per-frame outcomes, not request lifecycle states.
+			return a_state == "failed" || a_state == "failed_partial" ||
+			       a_state == "rejected" || a_state == "cancelled" ||
+			       a_state == "cancelled_partial" || a_state == "stopped" ||
+			       a_state == "dropped";
+		}
+
 		bool IsSafeSuffix(std::string_view a_suffix)
 		{
 			if (a_suffix.empty() || a_suffix.size() > 64)
@@ -422,10 +436,13 @@ namespace CSXCaptureCompanion
 					if (!child.is_object() || !child.contains("state") || !child["state"].is_string())
 						throw std::runtime_error("A sequence child has an invalid state.");
 					const auto state = child["state"].get<std::string>();
+					const auto written = IsWrittenChildState(state);
+					if (!written && !IsMissingChildState(state))
+						throw std::runtime_error("A sequence child has an unsupported final state.");
 					const auto timestamp = ReadTimestamp(child, "scheduledTimestampUs");
 					for (auto& plan : plans)
 						plan.scheduledTimestampsUs.push_back(timestamp);
-					if (state != "completed" && state != "completed_with_warnings")
+					if (!written)
 						continue;
 					const auto& artifacts = child.at("artifacts");
 					if (!artifacts.is_array() || artifacts.size() != plans.size())

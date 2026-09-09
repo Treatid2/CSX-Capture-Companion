@@ -148,7 +148,7 @@ Event OnOptionHighlight(Int option)
     ElseIf option == ComposeVideoPowerOption
         SetInfoText("Adds a lesser power that queues the latest completed sequence for companion-owned MP4 composition.")
     ElseIf option == EyeOption
-        SetInfoText("Select Left, Right, or a synchronized Both-eye capture. Both-eye video composition produces separate left and right MP4 files.")
+        SetInfoText("Select Left, Right, or a synchronized Both-eye capture. Both-eye composition produces one SBS MP4 with the left eye on the left and right eye on the right.")
     ElseIf option == ComposeNowOption
         SetInfoText("Queues the latest completed sequence.json. CSX does not encode video and the lossless source frames are retained.")
     EndIf

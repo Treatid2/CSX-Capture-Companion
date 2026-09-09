@@ -83,6 +83,30 @@ function Invoke-ExpectedFailure {
 	}
 }
 
+function Get-TreeHashes {
+	param([Parameter(Mandatory)] [string] $Root)
+	$hashes = @{}
+	foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
+		$hashes[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+	}
+	return $hashes
+}
+
+function Invoke-ExpectedFailureWithoutWrites {
+	param([Parameter(Mandatory)] [string] $Sequence)
+	$before = Get-TreeHashes -Root $resolvedWorkRoot
+	Invoke-ExpectedFailure -Sequence $Sequence
+	$after = Get-TreeHashes -Root $resolvedWorkRoot
+	if ($before.Count -ne $after.Count) {
+		throw "Rejected manifest changed the fixture inventory: $Sequence"
+	}
+	foreach ($path in $before.Keys) {
+		if (-not $after.ContainsKey($path) -or $after[$path] -ne $before[$path]) {
+			throw "Rejected manifest changed fixture bytes: $path"
+		}
+	}
+}
+
 function Invoke-CompositionWithSampleCount {
 	param(
 		[Parameter(Mandatory)] [string] $Sequence,
@@ -352,6 +376,30 @@ Write-TestManifest -Sequence $overflowTailSequence -Suffixes @('left') `
 	-States @('completed', 'dropped')
 Invoke-ExpectedFailure -Sequence $overflowTailSequence
 
+$emptyTrailingStateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_empty_trailing_state'
+Write-TestManifest -Sequence $emptyTrailingStateSequence -Suffixes @('left') `
+	-Timestamps @([uint64]6000000, [uint64]6020000) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', '')
+Invoke-ExpectedFailureWithoutWrites -Sequence $emptyTrailingStateSequence
+
+$unknownTrailingStateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unknown_trailing_state'
+Write-TestManifest -Sequence $unknownTrailingStateSequence -Suffixes @('left') `
+	-Timestamps @([uint64]6100000, [uint64]6120000) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', 'future_state')
+Invoke-ExpectedFailureWithoutWrites -Sequence $unknownTrailingStateSequence
+
+$emptyInteriorStateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_empty_interior_state'
+Write-TestManifest -Sequence $emptyInteriorStateSequence -Suffixes @('left') `
+	-Timestamps @([uint64]6200000, [uint64]6220000, [uint64]6240000) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', '', 'completed')
+Invoke-ExpectedFailureWithoutWrites -Sequence $emptyInteriorStateSequence
+
+$unknownInteriorStateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unknown_interior_state'
+Write-TestManifest -Sequence $unknownInteriorStateSequence -Suffixes @('left') `
+	-Timestamps @([uint64]6300000, [uint64]6320000, [uint64]6340000) -ArtifactPaths @($leftSource.FullName) `
+	-States @('completed', 'future_state', 'completed')
+Invoke-ExpectedFailureWithoutWrites -Sequence $unknownInteriorStateSequence
+
 $aliasSequence = Join-Path $resolvedWorkRoot 'CS_sequence_alias'
 $aliasSource = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left.mp4'
 Copy-Item -LiteralPath $leftSource.FullName -Destination $aliasSource
@@ -386,7 +434,11 @@ $unexpectedOutputs = @(
 	'CS_sequence_fractional_time-left.mp4',
 	'CS_sequence_overflow_time-left.mp4',
 	'CS_sequence_invalid_tail-left.mp4',
-	'CS_sequence_overflow_tail-left.mp4'
+	'CS_sequence_overflow_tail-left.mp4',
+	'CS_sequence_empty_trailing_state-left.mp4',
+	'CS_sequence_unknown_trailing_state-left.mp4',
+	'CS_sequence_empty_interior_state-left.mp4',
+	'CS_sequence_unknown_interior_state-left.mp4'
 )
 foreach ($name in $unexpectedOutputs) {
 	if (Test-Path -LiteralPath (Join-Path $resolvedWorkRoot $name)) {

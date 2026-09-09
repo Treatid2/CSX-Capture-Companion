@@ -352,6 +352,7 @@ namespace
 		}
 
 		std::size_t count = 0;
+		bool reachedEnd = false;
 		std::optional<LONGLONG> previousTime;
 		for (std::size_t attempt = 0; attempt < a_expectedCount + 64; ++attempt) {
 			ComPtr<IMFSample> sample;
@@ -367,8 +368,10 @@ namespace
 				std::cerr << "Could not decode the complete sample-count timeline.\n";
 				return 10;
 			}
-			if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0)
+			if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) {
+				reachedEnd = true;
 				break;
+			}
 			if (!sample)
 				continue;
 			LONGLONG duration = 0;
@@ -381,6 +384,10 @@ namespace
 			++count;
 			if (count > a_expectedCount)
 				break;
+		}
+		if (!reachedEnd) {
+			std::cerr << "Decoder did not report end-of-stream after the expected samples.\n";
+			return 10;
 		}
 		if (count != a_expectedCount) {
 			std::cerr << "Decoded " << count << " samples, expected " << a_expectedCount << ".\n";

@@ -23,6 +23,9 @@ available, the worker reports failure and leaves all lossless inputs untouched.
   Foundation sample times.
 - Timestamps must be unsigned, strictly increasing, and representable by Media
   Foundation. Invalid timelines fail before an output is created.
+- Current manifests admit only CSX's terminal per-frame states. Completed
+  states provide images; explicit failed, cancelled, stopped, rejected, or
+  dropped states provide hold positions. Unknown states fail before planning.
 - The encoder starts with the rounded median scheduled cadence and raises it,
   up to 120 fps, until every recorded slot has a distinct sample position.
   Timelines that cannot fit the 60,000-sample bound are rejected.

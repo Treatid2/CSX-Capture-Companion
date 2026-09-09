@@ -50,8 +50,9 @@ dropped frames—including drops after the final written image—repeat the
 preceding image rather than silently changing playback speed. The cadence is
 raised when necessary to keep every recorded slot distinct; malformed,
 excessive, or non-monotonic timelines are rejected before any output is
-created. Only bounded manifests and explicitly committed artifacts are
-consumed. Version 1 has no audio.
+created. Unknown child states are rejected rather than interpreted as dropped
+frames. Only bounded manifests and explicitly committed artifacts are consumed.
+Version 1 has no audio.
 
 ## Build status
 
