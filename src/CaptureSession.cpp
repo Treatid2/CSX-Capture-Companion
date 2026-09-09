@@ -87,6 +87,22 @@ namespace CSXCaptureCompanion
 		}
 	}
 
+	std::string AcceptedRequestId(const json& a_response) noexcept
+	{
+		try {
+			if (!IsSuccessfulResponse(a_response) || !a_response.contains("result") ||
+				!a_response["result"].is_object()) {
+				return {};
+			}
+			const auto& result = a_response["result"];
+			if (!result.contains("requestId") || !result["requestId"].is_string())
+				return {};
+			return result["requestId"].get<std::string>();
+		} catch (...) {
+			return {};
+		}
+	}
+
 	CaptureSession::CaptureSession(ScreenshotDispatch a_dispatch) :
 		dispatch(std::move(a_dispatch))
 	{}
@@ -159,18 +175,7 @@ namespace CSXCaptureCompanion
 		}
 
 		const auto response = dispatch(std::move(a_startRequest));
-		try {
-			if (!IsSuccessfulResponse(response) || !response.contains("result") ||
-				!response["result"].is_object()) {
-				return false;
-			}
-			const auto& result = response["result"];
-			if (!result.contains("requestId") || !result["requestId"].is_string())
-				return false;
-			requestId = result["requestId"].get<std::string>();
-		} catch (...) {
-			return false;
-		}
+		requestId = AcceptedRequestId(response);
 		if (requestId.empty())
 			return false;
 

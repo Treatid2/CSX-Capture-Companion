@@ -53,6 +53,26 @@ namespace
 		return passed;
 	}
 
+	bool TestAcceptedRequestReplies()
+	{
+		const std::vector<json> rejected = {
+			json::array(),
+			{ { "ok", true } },
+			{ { "ok", true }, { "result", 7 } },
+			{ { "ok", true }, { "result", { { "requestId", 9 } } } },
+			{ { "ok", true }, { "result", { { "requestId", "" } } } },
+		};
+		bool passed = true;
+		for (const auto& reply : rejected) {
+			passed &= Check(CSXCaptureCompanion::AcceptedRequestId(reply).empty(),
+				"A malformed acceptance reply produced a request ID.");
+		}
+		return passed && Check(
+			CSXCaptureCompanion::AcceptedRequestId(
+				{ { "ok", true }, { "result", { { "requestId", "accepted-A" } } } }) == "accepted-A",
+			"A valid acceptance reply did not produce its request ID.");
+	}
+
 	bool TestConcurrentToggle()
 	{
 		std::atomic_int starts{ 0 };
@@ -150,6 +170,7 @@ namespace
 
 int main()
 {
-	const auto passed = TestMalformedReplies() && TestConcurrentToggle() && TestRefreshThenSuccessorStart();
+	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
+	                    TestConcurrentToggle() && TestRefreshThenSuccessorStart();
 	return passed ? 0 : 1;
 }

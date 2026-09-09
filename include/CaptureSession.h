@@ -12,6 +12,7 @@ namespace CSXCaptureCompanion
 	using ScreenshotDispatch = std::function<nlohmann::json(nlohmann::json)>;
 
 	[[nodiscard]] bool IsSuccessfulResponse(const nlohmann::json& a_response) noexcept;
+	[[nodiscard]] std::string AcceptedRequestId(const nlohmann::json& a_response) noexcept;
 
 	class CaptureSession final
 	{

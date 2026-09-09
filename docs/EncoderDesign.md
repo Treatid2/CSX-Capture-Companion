@@ -46,9 +46,11 @@ is not promised while composition is active. Finish or stop composition before
 quitting Skyrim when immediate process exit matters.
 
 Before encoding, the worker validates every source, output, temporary path, and
-output suffix as one plan. Outputs are unique leaf names beside the frame-set
-directory and cannot alias a source. Each job uses a new temporary name; an
-unrelated pre-existing temporary file is never removed. A temporary output is
-renamed with write-through semantics only after `IMFSinkWriter::Finalize`
-succeeds. The worker never edits `sequence.json`, never deletes source frame
-files, and never writes into the Skyrim game directory.
+output suffix as one plan. It accepts at most two output streams, bounds the
+manifest and timeline sizes, and consumes only artifacts marked committed by
+CSX. Outputs are unique leaf names beside the frame-set directory and cannot
+alias a source. Each job uses a new temporary name; an unrelated pre-existing
+temporary file is never removed. A temporary output is renamed with
+write-through semantics only after `IMFSinkWriter::Finalize` succeeds. The
+worker never edits `sequence.json`, never deletes source frame files, and never
+writes into the Skyrim game directory.

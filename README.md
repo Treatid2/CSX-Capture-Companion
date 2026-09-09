@@ -47,7 +47,8 @@ set. Existing outputs are preserved with a numbered filename. Both-eye sessions
 produce a synchronized pair. Manifest timestamps drive sample timing, so
 dropped frames repeat the preceding image rather than silently changing
 playback speed; malformed, excessive, or non-monotonic timelines are rejected
-before any output is created. Version 1 has no audio.
+before any output is created. Only bounded manifests and explicitly committed
+artifacts are consumed. Version 1 has no audio.
 
 ## Build status
 

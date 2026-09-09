@@ -69,6 +69,8 @@ namespace
 			}
 			auto parsed = json::parse(response.jsonUtf8, response.jsonUtf8 + response.jsonBytes);
 			if (!parsed.is_object() || !parsed.contains("ok") || !parsed["ok"].is_boolean() ||
+				(parsed["ok"].get<bool>() &&
+					(!parsed.contains("result") || !parsed["result"].is_object())) ||
 				(parsed.contains("result") && !parsed["result"].is_object())) {
 				SKSE::log::error("CSX screenshot response had an invalid envelope");
 				return InvalidResponse();
@@ -91,6 +93,7 @@ namespace
 
 	bool ConnectToCSX()
 	{
+		g_screenshot.store(nullptr, std::memory_order_release);
 		CSX::ServiceAPI::RegistryMessage001 request;
 		auto* messaging = SKSE::GetMessagingInterface();
 		if (!messaging || !messaging->Dispatch(
@@ -119,7 +122,6 @@ namespace
 			request.registry->context, &query, &opaque, &descriptor);
 		if (status != CSX::ServiceAPI::Status::kSuccess || !opaque) {
 			SKSE::log::warn("CSX Screenshot API v1 is unavailable ({})", static_cast<std::uint32_t>(status));
-			g_screenshot.store(nullptr, std::memory_order_release);
 			return false;
 		}
 
@@ -181,7 +183,7 @@ namespace
 			{ "action", "capture" }, { "useSettings", false },
 			{ "capture", CaptureDescriptor(g_eye.load(std::memory_order_acquire), "png") },
 		});
-		return CSXCaptureCompanion::IsSuccessfulResponse(response);
+		return !CSXCaptureCompanion::AcceptedRequestId(response).empty();
 	}
 
 	bool ToggleFrameSequence(RE::StaticFunctionTag*)

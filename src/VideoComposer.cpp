@@ -64,6 +64,9 @@ namespace CSXCaptureCompanion
 			std::filesystem::path temporary;
 		};
 
+		constexpr std::uintmax_t kMaximumManifestBytes = 16 * 1024 * 1024;
+		constexpr std::size_t kMaximumStreams = 2;
+		constexpr std::size_t kMaximumSourceFrames = 60'000;
 		std::atomic_uint64_t g_temporarySequence{ 1 };
 
 		class ComRuntime final
@@ -168,8 +171,13 @@ namespace CSXCaptureCompanion
 			const std::filesystem::path& a_sequenceDirectory,
 			const json& a_artifact)
 		{
-			if (!a_artifact.is_object() || !a_artifact.contains("path") || !a_artifact["path"].is_string())
+			if (!a_artifact.is_object() || !a_artifact.contains("path") || !a_artifact["path"].is_string()) {
 				throw std::runtime_error("A completed frame is missing its artifact path.");
+			}
+			if (!a_artifact.contains("committed") || !a_artifact["committed"].is_boolean() ||
+				!a_artifact["committed"].get<bool>()) {
+				throw std::runtime_error("A completed frame references an uncommitted artifact.");
+			}
 			const auto wide = Utf8ToWide(a_artifact["path"].get<std::string>());
 			const std::filesystem::path path(wide);
 			return path.is_absolute() ? path : a_sequenceDirectory / path;
@@ -218,7 +226,6 @@ namespace CSXCaptureCompanion
 
 		void ValidateTimeline(const StreamPlan& a_plan)
 		{
-			constexpr std::uint64_t maximumComposedSamples = 60'000;
 			constexpr auto maximumMicroseconds =
 				static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()) / 10;
 			const auto firstTimestamp = a_plan.frames.front().timestampUs;
@@ -236,7 +243,7 @@ namespace CSXCaptureCompanion
 						throw std::runtime_error("A frame duration is outside the supported Media Foundation range.");
 				}
 				const auto tick = TimestampToTick(timestamp - firstTimestamp, frameRate);
-				if (tick >= maximumComposedSamples)
+				if (tick >= kMaximumSourceFrames)
 					throw std::runtime_error("The manifest timeline would produce too many video samples.");
 				if (index > 0 && tick <= previousTick)
 					throw std::runtime_error("Frame timestamps are too close for the selected video cadence.");
@@ -276,6 +283,10 @@ namespace CSXCaptureCompanion
 			                          a_manifestOrDirectory / "sequence.json" :
 			                          a_manifestOrDirectory;
 			const auto sequenceDirectory = manifestPath.parent_path();
+			std::error_code manifestError;
+			const auto manifestBytes = std::filesystem::file_size(manifestPath, manifestError);
+			if (manifestError || manifestBytes > kMaximumManifestBytes)
+				throw std::runtime_error("The completed sequence manifest is unavailable or too large.");
 			std::ifstream stream(manifestPath, std::ios::binary);
 			if (!stream) {
 				throw std::runtime_error("The completed sequence.json could not be opened.");
@@ -295,7 +306,10 @@ namespace CSXCaptureCompanion
 				} else {
 					plans.push_back({ "left", {} });
 				}
-				for (const auto& entry : manifest.at("frames")) {
+				const auto& frames = manifest.at("frames");
+				if (!frames.is_array() || frames.size() > kMaximumSourceFrames)
+					throw std::runtime_error("The legacy manifest contains too many frame records.");
+				for (const auto& entry : frames) {
 					if (!entry.value("written", false))
 						continue;
 					const auto timestamp = ReadTimestamp(entry, "timestampUs");
@@ -317,6 +331,8 @@ namespace CSXCaptureCompanion
 				const auto outputs = manifest.at("capture").at("outputs");
 				if (!outputs.is_array() || outputs.empty())
 					throw std::runtime_error("The Screenshot API manifest has no outputs.");
+				if (outputs.size() > kMaximumStreams)
+					throw std::runtime_error("The Screenshot API manifest has too many outputs.");
 				std::set<std::string, std::less<>> suffixes;
 				for (const auto& output : outputs) {
 					if (!output.is_object())
@@ -341,7 +357,10 @@ namespace CSXCaptureCompanion
 						throw std::runtime_error("Output suffixes must be unique.");
 					plans.push_back({ std::move(suffix), {} });
 				}
-				for (const auto& child : manifest.at("children")) {
+				const auto& children = manifest.at("children");
+				if (!children.is_array() || children.size() > kMaximumSourceFrames)
+					throw std::runtime_error("The Screenshot API manifest contains too many child records.");
+				for (const auto& child : children) {
 					const auto state = child.value("state", std::string{});
 					if (state != "completed" && state != "completed_with_warnings")
 						continue;

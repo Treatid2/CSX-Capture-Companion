@@ -26,7 +26,8 @@ function Write-TestManifest {
 		[Parameter(Mandatory)] [string] $Sequence,
 		[Parameter(Mandatory)] [string[]] $Suffixes,
 		[Parameter(Mandatory)] [object[]] $Timestamps,
-		[Parameter(Mandatory)] [string[]] $ArtifactPaths
+		[Parameter(Mandatory)] [string[]] $ArtifactPaths,
+		[bool] $Committed = $true
 	)
 	if ($Suffixes.Count -ne $ArtifactPaths.Count) {
 		throw 'Each test output must have one artifact path.'
@@ -35,7 +36,7 @@ function Write-TestManifest {
 	$children = @()
 	for ($index = 0; $index -lt $Timestamps.Count; $index++) {
 		$artifacts = foreach ($path in $ArtifactPaths) {
-			[ordered]@{ path = $path; committed = $true }
+			[ordered]@{ path = $path; committed = $Committed }
 		}
 		$children += [ordered]@{
 			ordinal = $index + 1
@@ -203,6 +204,14 @@ $duplicateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_duplicate'
 Write-TestManifest -Sequence $duplicateSequence -Suffixes @('left', 'LEFT') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName)
 Invoke-ExpectedFailure -Sequence $duplicateSequence
 
+$tooManyOutputsSequence = Join-Path $resolvedWorkRoot 'CS_sequence_too_many_outputs'
+Write-TestManifest -Sequence $tooManyOutputsSequence -Suffixes @('left', 'right', 'combined') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName, $leftSource.FullName)
+Invoke-ExpectedFailure -Sequence $tooManyOutputsSequence
+
+$uncommittedSequence = Join-Path $resolvedWorkRoot 'CS_sequence_uncommitted'
+Write-TestManifest -Sequence $uncommittedSequence -Suffixes @('left') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName) -Committed $false
+Invoke-ExpectedFailure -Sequence $uncommittedSequence
+
 $duplicateTimeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_duplicate_time'
 Write-TestManifest -Sequence $duplicateTimeSequence -Suffixes @('left') -Timestamps @([uint64]1000, [uint64]1000) -ArtifactPaths @($leftSource.FullName)
 Invoke-ExpectedFailure -Sequence $duplicateTimeSequence
@@ -249,6 +258,8 @@ foreach ($source in $sourceFiles) {
 $unexpectedOutputs = @(
 	'CS_sequence_unsafe-left.mp4',
 	'CS_sequence_duplicate-left.mp4',
+	'CS_sequence_too_many_outputs-left.mp4',
+	'CS_sequence_uncommitted-left.mp4',
 	'CS_sequence_duplicate_time-left.mp4',
 	'CS_sequence_decreasing_time-left.mp4',
 	'CS_sequence_negative_time-left.mp4',
