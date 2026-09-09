@@ -43,9 +43,11 @@ encodes H.264 in an MP4 container. Encoding never runs on the render thread,
 source frames are retained, and output is committed only after finalization.
 
 Left and Right sessions produce one `-left.mp4` or `-right.mp4` beside the frame
-set. Both-eye sessions produce a synchronized pair. Manifest timestamps drive
-sample timing, so dropped frames extend the preceding sample rather than
-silently changing playback speed. Version 1 has no audio.
+set. Existing outputs are preserved with a numbered filename. Both-eye sessions
+produce a synchronized pair. Manifest timestamps drive sample timing, so
+dropped frames repeat the preceding image rather than silently changing
+playback speed; malformed, excessive, or non-monotonic timelines are rejected
+before any output is created. Version 1 has no audio.
 
 ## Build status
 

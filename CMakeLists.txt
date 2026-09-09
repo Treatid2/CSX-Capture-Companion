@@ -22,6 +22,7 @@ add_commonlibsse_plugin(
     AUTHOR "Treatid2"
     SOURCES
         src/main.cpp
+        src/CaptureSession.cpp
         src/VideoComposer.cpp
 )
 
@@ -109,4 +110,19 @@ if(BUILD_TESTING)
             -WorkRoot "${CMAKE_CURRENT_BINARY_DIR}/composer-smoke"
             -AllowedRoot "${CMAKE_CURRENT_BINARY_DIR}"
     )
+
+    add_executable(
+        CSXCaptureSessionTests
+        tests/CaptureSessionTests.cpp
+        src/CaptureSession.cpp
+    )
+    target_compile_features(CSXCaptureSessionTests PRIVATE cxx_std_23)
+    target_include_directories(CSXCaptureSessionTests PRIVATE include)
+    target_compile_definitions(CSXCaptureSessionTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_precompile_headers(CSXCaptureSessionTests PRIVATE include/PCH.h)
+    target_link_libraries(CSXCaptureSessionTests PRIVATE CommonLibSSE::CommonLibSSE)
+    if(MSVC)
+        target_compile_options(CSXCaptureSessionTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    endif()
+    add_test(NAME capture-session COMMAND CSXCaptureSessionTests)
 endif()

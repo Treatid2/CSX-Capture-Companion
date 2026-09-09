@@ -21,9 +21,13 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 
 - `timestampUs` is normalized to zero and converted to 100-nanosecond Media
   Foundation sample times.
-- Each sample lasts until the next written frame. A dropped manifest entry
-  therefore extends the preceding sample without changing playback speed.
-- A Left or Right session produces one `-left.mp4` or `-right.mp4` file.
+- Timestamps must be unsigned, strictly increasing, and representable by Media
+  Foundation. Invalid timelines fail before an output is created.
+- The encoder maps source timestamps to a bounded constant-rate cadence and
+  duplicates the preceding image across missing cadence slots. A dropped frame
+  therefore remains a visible hold without changing playback speed.
+- A Left or Right session produces one `-left.mp4` or `-right.mp4` file. If that
+  name already exists, a numeric suffix preserves the earlier output.
 - A Both session produces paired `-left.mp4` and `-right.mp4` files.
 - The first written frame establishes dimensions; a later size change fails the
   composition instead of creating a malformed stream.
@@ -35,7 +39,16 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 encodes away from Papyrus, the SKSE message callback, and the render thread. A
 second request while queued or encoding is rejected as busy.
 
-Each output is first written as `*.tmp.mp4` beside the frame-set directory. It
-is renamed with write-through semantics only after `IMFSinkWriter::Finalize`
-succeeds. The worker never edits `sequence.json`, never deletes source frame files, and
-never writes into the Skyrim game directory.
+Version 1 owns and joins an active worker during process shutdown so no encoder
+or notification callback can outlive the plugin. Windows codec and filesystem
+calls are synchronous and are not cooperatively cancellable, so bounded shutdown
+is not promised while composition is active. Finish or stop composition before
+quitting Skyrim when immediate process exit matters.
+
+Before encoding, the worker validates every source, output, temporary path, and
+output suffix as one plan. Outputs are unique leaf names beside the frame-set
+directory and cannot alias a source. Each job uses a new temporary name; an
+unrelated pre-existing temporary file is never removed. A temporary output is
+renamed with write-through semantics only after `IMFSinkWriter::Finalize`
+succeeds. The worker never edits `sequence.json`, never deletes source frame
+files, and never writes into the Skyrim game directory.
