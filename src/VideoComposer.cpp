@@ -11,8 +11,12 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cwctype>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -49,9 +53,32 @@ namespace CSXCaptureCompanion
 
 		struct StreamPlan
 		{
+			std::string view;
 			std::string suffix;
 			std::vector<Frame> frames;
+			std::vector<std::uint64_t> scheduledTimestampsUs;
 		};
+
+		struct TimelinePlan
+		{
+			std::uint32_t frameRate{};
+			std::vector<std::uint64_t> frameTicks;
+			std::uint64_t finalTick{};
+		};
+
+		struct EncodingPlan
+		{
+			const StreamPlan* primary{};
+			const StreamPlan* secondary{};
+			std::filesystem::path output;
+			std::filesystem::path temporary;
+			TimelinePlan timeline;
+		};
+
+		constexpr std::uintmax_t kMaximumManifestBytes = 16 * 1024 * 1024;
+		constexpr std::size_t kMaximumStreams = 2;
+		constexpr std::size_t kMaximumSourceFrames = 60'000;
+		std::atomic_uint64_t g_temporarySequence{ 1 };
 
 		class ComRuntime final
 		{
@@ -155,11 +182,163 @@ namespace CSXCaptureCompanion
 			const std::filesystem::path& a_sequenceDirectory,
 			const json& a_artifact)
 		{
-			if (!a_artifact.is_object() || !a_artifact.contains("path") || !a_artifact["path"].is_string())
+			if (!a_artifact.is_object() || !a_artifact.contains("path") || !a_artifact["path"].is_string()) {
 				throw std::runtime_error("A completed frame is missing its artifact path.");
+			}
+			if (!a_artifact.contains("committed") || !a_artifact["committed"].is_boolean() ||
+				!a_artifact["committed"].get<bool>()) {
+				throw std::runtime_error("A completed frame references an uncommitted artifact.");
+			}
 			const auto wide = Utf8ToWide(a_artifact["path"].get<std::string>());
 			const std::filesystem::path path(wide);
 			return path.is_absolute() ? path : a_sequenceDirectory / path;
+		}
+
+		std::uint64_t ReadTimestamp(const json& a_object, std::string_view a_name)
+		{
+			if (!a_object.is_object() || !a_object.contains(a_name) || !a_object[a_name].is_number_unsigned())
+				throw std::runtime_error("A sequence frame has an invalid timestamp.");
+			return a_object[a_name].get<std::uint64_t>();
+		}
+
+		bool IsWrittenChildState(std::string_view a_state)
+		{
+			return a_state == "completed" || a_state == "completed_with_warnings";
+		}
+
+		bool IsMissingChildState(std::string_view a_state)
+		{
+			// Final manifests admit terminal per-frame outcomes, not request lifecycle states.
+			return a_state == "failed" || a_state == "failed_partial" ||
+			       a_state == "rejected" || a_state == "cancelled" ||
+			       a_state == "cancelled_partial" || a_state == "stopped" ||
+			       a_state == "dropped";
+		}
+
+		bool IsSafeSuffix(std::string_view a_suffix)
+		{
+			if (a_suffix.empty() || a_suffix.size() > 64)
+				return false;
+			return std::ranges::all_of(a_suffix, [](unsigned char a_character) {
+				return (a_character >= 'a' && a_character <= 'z') ||
+				       (a_character >= 'A' && a_character <= 'Z') ||
+				       (a_character >= '0' && a_character <= '9') ||
+				       a_character == '-' || a_character == '_';
+			});
+		}
+
+		std::uint32_t EstimateFrameRate(const std::vector<std::uint64_t>& a_timestamps)
+		{
+			std::vector<std::uint64_t> intervals;
+			for (std::size_t index = 1; index < a_timestamps.size(); ++index) {
+				intervals.push_back(a_timestamps[index] - a_timestamps[index - 1]);
+			}
+			if (intervals.empty())
+				return 60;
+			const auto middle = intervals.begin() + static_cast<std::ptrdiff_t>(intervals.size() / 2);
+			std::nth_element(intervals.begin(), middle, intervals.end());
+			const auto interval = std::max<std::uint64_t>(*middle, 1);
+			const auto roundedRate = (1'000'000 + interval / 2) / interval;
+			return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(roundedRate, 1, 120));
+		}
+
+		std::uint64_t TimestampToTick(std::uint64_t a_normalizedUs, std::uint32_t a_frameRate)
+		{
+			const auto wholeSeconds = a_normalizedUs / 1'000'000;
+			const auto remainingUs = a_normalizedUs % 1'000'000;
+			return wholeSeconds * a_frameRate + (remainingUs * a_frameRate + 500'000) / 1'000'000;
+		}
+
+		TimelinePlan BuildTimeline(const StreamPlan& a_plan)
+		{
+			constexpr auto maximumMicroseconds =
+				static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()) / 10;
+			if (a_plan.scheduledTimestampsUs.empty())
+				throw std::runtime_error("The sequence contains no scheduled frame timestamps.");
+			for (std::size_t index = 1; index < a_plan.scheduledTimestampsUs.size(); ++index) {
+				const auto previous = a_plan.scheduledTimestampsUs[index - 1];
+				const auto timestamp = a_plan.scheduledTimestampsUs[index];
+				if (timestamp <= previous)
+					throw std::runtime_error("Scheduled frame timestamps must be strictly increasing.");
+				if (timestamp - previous > maximumMicroseconds)
+					throw std::runtime_error("A scheduled frame duration is outside the supported range.");
+			}
+
+			const auto firstTimestamp = a_plan.frames.front().timestampUs;
+			for (std::size_t index = 0; index < a_plan.frames.size(); ++index) {
+				const auto timestamp = a_plan.frames[index].timestampUs;
+				if (timestamp < firstTimestamp || timestamp - firstTimestamp > maximumMicroseconds)
+					throw std::runtime_error("A frame timestamp is outside the supported Media Foundation range.");
+				if (index > 0) {
+					const auto previous = a_plan.frames[index - 1].timestampUs;
+					if (timestamp <= previous)
+						throw std::runtime_error("Frame timestamps must be strictly increasing.");
+					if (timestamp - previous > maximumMicroseconds)
+						throw std::runtime_error("A frame duration is outside the supported Media Foundation range.");
+				}
+				if (!std::binary_search(
+						a_plan.scheduledTimestampsUs.begin(), a_plan.scheduledTimestampsUs.end(), timestamp)) {
+					throw std::runtime_error("A written frame timestamp is absent from the scheduled timeline.");
+				}
+			}
+
+			auto firstRelevant = std::lower_bound(
+				a_plan.scheduledTimestampsUs.begin(), a_plan.scheduledTimestampsUs.end(), firstTimestamp);
+			auto frameRate = EstimateFrameRate(a_plan.scheduledTimestampsUs);
+			for (; frameRate <= 120; ++frameRate) {
+				bool distinct = true;
+				std::uint64_t previousTick = 0;
+				for (auto timestamp = firstRelevant; timestamp != a_plan.scheduledTimestampsUs.end(); ++timestamp) {
+					const auto tick = TimestampToTick(*timestamp - firstTimestamp, frameRate);
+					if (timestamp != firstRelevant && tick <= previousTick) {
+						distinct = false;
+						break;
+					}
+					previousTick = tick;
+				}
+				if (distinct)
+					break;
+			}
+			if (frameRate > 120)
+				throw std::runtime_error("Frame timestamps are too close for the supported video cadence.");
+
+			TimelinePlan result;
+			result.frameRate = frameRate;
+			result.finalTick = TimestampToTick(
+				a_plan.scheduledTimestampsUs.back() - firstTimestamp, frameRate);
+			if (result.finalTick >= kMaximumSourceFrames)
+				throw std::runtime_error("The manifest timeline would produce too many video samples.");
+			result.frameTicks.reserve(a_plan.frames.size());
+			for (const auto& frame : a_plan.frames) {
+				result.frameTicks.push_back(TimestampToTick(frame.timestampUs - firstTimestamp, frameRate));
+			}
+			return result;
+		}
+
+		std::wstring ComparablePath(const std::filesystem::path& a_path)
+		{
+			std::error_code error;
+			auto normalized = std::filesystem::weakly_canonical(a_path, error);
+			if (error) {
+				error.clear();
+				normalized = std::filesystem::absolute(a_path, error).lexically_normal();
+				if (error)
+					throw std::runtime_error("Could not normalize a capture or output path.");
+			}
+			auto value = normalized.native();
+			std::ranges::transform(value, value.begin(), [](wchar_t a_character) {
+				return static_cast<wchar_t>(std::towlower(a_character));
+			});
+			return value;
+		}
+
+		bool PathsAlias(const std::filesystem::path& a_left, const std::filesystem::path& a_right)
+		{
+			if (ComparablePath(a_left) == ComparablePath(a_right))
+				return true;
+			std::error_code error;
+			const auto equivalent = std::filesystem::equivalent(a_left, a_right, error);
+			return !error && equivalent;
 		}
 
 		std::vector<StreamPlan> ReadManifest(const std::filesystem::path& a_manifestOrDirectory)
@@ -168,6 +347,10 @@ namespace CSXCaptureCompanion
 			                          a_manifestOrDirectory / "sequence.json" :
 			                          a_manifestOrDirectory;
 			const auto sequenceDirectory = manifestPath.parent_path();
+			std::error_code manifestError;
+			const auto manifestBytes = std::filesystem::file_size(manifestPath, manifestError);
+			if (manifestError || manifestBytes > kMaximumManifestBytes)
+				throw std::runtime_error("The completed sequence manifest is unavailable or too large.");
 			std::ifstream stream(manifestPath, std::ios::binary);
 			if (!stream) {
 				throw std::runtime_error("The completed sequence.json could not be opened.");
@@ -180,17 +363,22 @@ namespace CSXCaptureCompanion
 					throw std::runtime_error("The legacy manifest is not complete.");
 				const auto eye = manifest.value("eye", "Left");
 				if (eye == "Both") {
-					plans.push_back({ "-left", {} });
-					plans.push_back({ "-right", {} });
+					plans.push_back({ "left_eye", "left", {}, {} });
+					plans.push_back({ "right_eye", "right", {}, {} });
 				} else if (eye == "Right") {
-					plans.push_back({ "-right", {} });
+					plans.push_back({ "right_eye", "right", {}, {} });
 				} else {
-					plans.push_back({ "-left", {} });
+					plans.push_back({ "left_eye", "left", {}, {} });
 				}
-				for (const auto& entry : manifest.at("frames")) {
+				const auto& frames = manifest.at("frames");
+				if (!frames.is_array() || frames.size() > kMaximumSourceFrames)
+					throw std::runtime_error("The legacy manifest contains too many frame records.");
+				for (const auto& entry : frames) {
+					const auto timestamp = ReadTimestamp(entry, "timestampUs");
+					for (auto& plan : plans)
+						plan.scheduledTimestampsUs.push_back(timestamp);
 					if (!entry.value("written", false))
 						continue;
-					const auto timestamp = entry.at("timestampUs").get<std::uint64_t>();
 					const auto& paths = entry.at("paths");
 					if (!paths.is_array() || paths.size() != plans.size())
 						throw std::runtime_error("A written frame has the wrong number of eye paths.");
@@ -209,15 +397,53 @@ namespace CSXCaptureCompanion
 				const auto outputs = manifest.at("capture").at("outputs");
 				if (!outputs.is_array() || outputs.empty())
 					throw std::runtime_error("The Screenshot API manifest has no outputs.");
+				if (outputs.size() > kMaximumStreams)
+					throw std::runtime_error("The Screenshot API manifest has too many outputs.");
+				std::set<std::string, std::less<>> suffixes;
+				std::set<std::string, std::less<>> views;
 				for (const auto& output : outputs) {
-					const auto suffix = output.value("nameSuffix", output.value("view", std::string("video")));
-					plans.push_back({ "-" + suffix, {} });
+					if (!output.is_object())
+						throw std::runtime_error("A Screenshot API output entry is invalid.");
+					if (!output.contains("view") || !output["view"].is_string())
+						throw std::runtime_error("A Screenshot API output has no usable view.");
+					const auto view = output["view"].get<std::string>();
+					if ((view != "left_eye" && view != "right_eye") || !views.insert(view).second)
+						throw std::runtime_error("Video composition requires unique left- or right-eye outputs.");
+					std::string suffix;
+					if (output.contains("nameSuffix")) {
+						if (!output["nameSuffix"].is_string())
+							throw std::runtime_error("A Screenshot API output suffix is invalid.");
+						suffix = output["nameSuffix"].get<std::string>();
+					} else if (output.contains("view") && output["view"].is_string()) {
+						suffix = output["view"].get<std::string>();
+					} else {
+						throw std::runtime_error("A Screenshot API output has no usable name.");
+					}
+					if (!IsSafeSuffix(suffix))
+						throw std::runtime_error("Output suffixes must be safe filename components.");
+					auto comparable = suffix;
+					std::ranges::transform(comparable, comparable.begin(), [](unsigned char a_character) {
+						return static_cast<char>(std::tolower(a_character));
+					});
+					if (!suffixes.insert(comparable).second)
+						throw std::runtime_error("Output suffixes must be unique.");
+					plans.push_back({ view, std::move(suffix), {}, {} });
 				}
-				for (const auto& child : manifest.at("children")) {
-					const auto state = child.value("state", std::string{});
-					if (state != "completed" && state != "completed_with_warnings")
+				const auto& children = manifest.at("children");
+				if (!children.is_array() || children.size() > kMaximumSourceFrames)
+					throw std::runtime_error("The Screenshot API manifest contains too many child records.");
+				for (const auto& child : children) {
+					if (!child.is_object() || !child.contains("state") || !child["state"].is_string())
+						throw std::runtime_error("A sequence child has an invalid state.");
+					const auto state = child["state"].get<std::string>();
+					const auto written = IsWrittenChildState(state);
+					if (!written && !IsMissingChildState(state))
+						throw std::runtime_error("A sequence child has an unsupported final state.");
+					const auto timestamp = ReadTimestamp(child, "scheduledTimestampUs");
+					for (auto& plan : plans)
+						plan.scheduledTimestampsUs.push_back(timestamp);
+					if (!written)
 						continue;
-					const auto timestamp = child.at("scheduledTimestampUs").get<std::uint64_t>();
 					const auto& artifacts = child.at("artifacts");
 					if (!artifacts.is_array() || artifacts.size() != plans.size())
 						throw std::runtime_error("A completed frame has the wrong number of output artifacts.");
@@ -236,6 +462,97 @@ namespace CSXCaptureCompanion
 				}
 			}
 			return plans;
+		}
+
+		std::vector<EncodingPlan> BuildEncodingPlans(
+			const std::filesystem::path& a_sequenceDirectory,
+			const std::vector<StreamPlan>& a_streams)
+		{
+			struct OutputSource
+			{
+				const StreamPlan* primary{};
+				const StreamPlan* secondary{};
+				std::string suffix;
+				TimelinePlan timeline;
+			};
+
+			std::vector<OutputSource> sources;
+			if (a_streams.size() == 1) {
+				sources.push_back({
+					&a_streams.front(), nullptr, a_streams.front().suffix, BuildTimeline(a_streams.front()) });
+			} else {
+				const StreamPlan* left = nullptr;
+				const StreamPlan* right = nullptr;
+				for (const auto& stream : a_streams) {
+					if (stream.view == "left_eye")
+						left = &stream;
+					else if (stream.view == "right_eye")
+						right = &stream;
+				}
+				if (!left || !right || left->frames.size() != right->frames.size() ||
+					left->scheduledTimestampsUs != right->scheduledTimestampsUs) {
+					throw std::runtime_error("A stereo sequence requires synchronized left and right eyes.");
+				}
+				for (std::size_t index = 0; index < left->frames.size(); ++index) {
+					if (left->frames[index].timestampUs != right->frames[index].timestampUs)
+						throw std::runtime_error("Stereo eye frames have different timestamps.");
+				}
+				sources.push_back({ left, right, "sbs", BuildTimeline(*left) });
+			}
+
+			const auto outputDirectory = a_sequenceDirectory.parent_path();
+			const auto sequenceName = a_sequenceDirectory.filename().wstring();
+			std::vector<EncodingPlan> result;
+			std::set<std::wstring> reserved;
+			std::uint32_t outputOrdinal = 1;
+			for (; outputOrdinal <= 10'000; ++outputOrdinal) {
+				const auto available = std::ranges::all_of(sources, [&](const OutputSource& a_source) {
+					const auto baseName = sequenceName + L"-" + Utf8ToWide(a_source.suffix);
+					const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
+					return !std::filesystem::exists(outputDirectory / (baseName + ordinal + L".mp4"));
+				});
+				if (available)
+					break;
+			}
+			if (outputOrdinal > 10'000)
+				throw std::runtime_error("No available video output name could be found.");
+
+			for (const auto& source : sources) {
+				const auto suffix = Utf8ToWide(source.suffix);
+				const auto baseName = sequenceName + L"-" + suffix;
+				const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
+				auto output = outputDirectory / (baseName + ordinal + L".mp4");
+
+				std::filesystem::path temporary;
+				for (std::uint32_t attempt = 0; attempt < 32; ++attempt) {
+					const auto token = g_temporarySequence.fetch_add(1, std::memory_order_relaxed);
+					temporary = outputDirectory /
+						(baseName + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+							std::to_wstring(token) + L".tmp.mp4");
+					if (!std::filesystem::exists(temporary))
+						break;
+					temporary.clear();
+				}
+				if (temporary.empty())
+					throw std::runtime_error("No available temporary video output name could be found.");
+
+				if (!reserved.insert(ComparablePath(output)).second ||
+					!reserved.insert(ComparablePath(temporary)).second) {
+					throw std::runtime_error("Video output paths must be unique.");
+				}
+				result.push_back({
+					source.primary, source.secondary, std::move(output), std::move(temporary), source.timeline });
+			}
+
+			for (const auto& encoding : result) {
+				for (const auto& stream : a_streams) {
+					for (const auto& frame : stream.frames) {
+						if (PathsAlias(frame.path, encoding.output) || PathsAlias(frame.path, encoding.temporary))
+							throw std::runtime_error("A video output path aliases a lossless source frame.");
+					}
+				}
+			}
+			return result;
 		}
 
 		struct DecodedFrame
@@ -293,30 +610,70 @@ namespace CSXCaptureCompanion
 			return decoded;
 		}
 
-		std::uint32_t EstimateFrameRate(const std::vector<Frame>& a_frames)
+		DecodedFrame DecodeOutputFrame(
+			IWICImagingFactory* a_factory,
+			const EncodingPlan& a_plan,
+			std::size_t a_index)
 		{
-			std::vector<std::uint64_t> intervals;
-			for (std::size_t index = 1; index < a_frames.size(); ++index) {
-				if (a_frames[index].timestampUs > a_frames[index - 1].timestampUs) {
-					intervals.push_back(a_frames[index].timestampUs - a_frames[index - 1].timestampUs);
-				}
+			auto primary = DecodeFrameAsset(a_factory, a_plan.primary->frames.at(a_index).path);
+			if (!a_plan.secondary)
+				return primary;
+
+			auto secondary = DecodeFrameAsset(a_factory, a_plan.secondary->frames.at(a_index).path);
+			if (primary.width != secondary.width || primary.height != secondary.height)
+				throw std::runtime_error("Stereo source eyes have different dimensions.");
+			if (primary.width > std::numeric_limits<std::uint32_t>::max() - secondary.width)
+				throw std::runtime_error("The side-by-side video width is too large.");
+
+			DecodedFrame combined;
+			combined.width = primary.width + secondary.width;
+			combined.height = primary.height;
+			if (combined.width > std::numeric_limits<std::uint32_t>::max() / 4)
+				throw std::runtime_error("The side-by-side video stride is too large.");
+			combined.stride = combined.width * 4;
+			const auto bytes = static_cast<std::uint64_t>(combined.stride) * combined.height;
+			if (bytes > std::numeric_limits<std::uint32_t>::max())
+				throw std::runtime_error("The side-by-side frame is too large for a Media Foundation sample.");
+			combined.pixels.resize(static_cast<std::size_t>(bytes));
+			for (std::uint32_t row = 0; row < combined.height; ++row) {
+				auto* destination = combined.pixels.data() + static_cast<std::size_t>(row) * combined.stride;
+				const auto* left = primary.pixels.data() + static_cast<std::size_t>(row) * primary.stride;
+				const auto* right = secondary.pixels.data() + static_cast<std::size_t>(row) * secondary.stride;
+				std::copy_n(left, primary.stride, destination);
+				std::copy_n(right, secondary.stride, destination + primary.stride);
 			}
-			if (intervals.empty()) {
-				return 60;
-			}
-			const auto middle = intervals.begin() + static_cast<std::ptrdiff_t>(intervals.size() / 2);
-			std::nth_element(intervals.begin(), middle, intervals.end());
-			const auto interval = std::max<std::uint64_t>(*middle, 1);
-			return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(1'000'000 / interval, 1, 120));
+			return combined;
 		}
 
-		void EncodeStream(
-			IWICImagingFactory* a_factory,
-			const StreamPlan& a_plan,
-			const std::filesystem::path& a_outputPath)
+		void WriteFrameSample(
+			IMFSinkWriter* a_writer,
+			DWORD a_streamIndex,
+			const DecodedFrame& a_frame,
+			LONGLONG a_sampleTime,
+			LONGLONG a_sampleDuration)
 		{
-			const auto first = DecodeFrameAsset(a_factory, a_plan.frames.front().path);
-			const auto frameRate = EstimateFrameRate(a_plan.frames);
+			ComPtr<IMFMediaBuffer> buffer;
+			Check(MFCreateMemoryBuffer(static_cast<DWORD>(a_frame.pixels.size()), buffer.GetAddressOf()),
+				"MFCreateMemoryBuffer");
+			BYTE* destination = nullptr;
+			Check(buffer->Lock(&destination, nullptr, nullptr), "IMFMediaBuffer::Lock");
+			std::copy(a_frame.pixels.begin(), a_frame.pixels.end(), destination);
+			Check(buffer->Unlock(), "IMFMediaBuffer::Unlock");
+			Check(buffer->SetCurrentLength(static_cast<DWORD>(a_frame.pixels.size())), "Set sample length");
+
+			ComPtr<IMFSample> sample;
+			Check(MFCreateSample(sample.GetAddressOf()), "MFCreateSample");
+			Check(sample->AddBuffer(buffer.Get()), "IMFSample::AddBuffer");
+			Check(sample->SetSampleTime(a_sampleTime), "Set sample time");
+			Check(sample->SetSampleDuration(a_sampleDuration), "Set sample duration");
+			Check(a_writer->WriteSample(a_streamIndex, sample.Get()), "IMFSinkWriter::WriteSample");
+		}
+
+		void EncodeStream(IWICImagingFactory* a_factory, const EncodingPlan& a_plan)
+		{
+			const auto first = DecodeOutputFrame(a_factory, a_plan, 0);
+			const auto& timeline = a_plan.primary->frames;
+			const auto frameRate = a_plan.timeline.frameRate;
 			const auto pixelsPerSecond =
 				static_cast<std::uint64_t>(first.width) * first.height * frameRate;
 			const auto bitrate64 = std::clamp<std::uint64_t>(pixelsPerSecond / 8, 4'000'000, 50'000'000);
@@ -329,7 +686,7 @@ namespace CSXCaptureCompanion
 
 			ComPtr<IMFSinkWriter> writer;
 			Check(MFCreateSinkWriterFromURL(
-				a_outputPath.c_str(),
+				a_plan.temporary.c_str(),
 				nullptr,
 				attributes.Get(),
 				writer.GetAddressOf()),
@@ -360,40 +717,27 @@ namespace CSXCaptureCompanion
 			Check(writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr), "IMFSinkWriter::SetInputMediaType");
 			Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
 
-			const auto firstTimestamp = a_plan.frames.front().timestampUs;
-			std::uint64_t fallbackDurationUs = 1'000'000 / frameRate;
-			for (std::size_t index = 0; index < a_plan.frames.size(); ++index) {
-				auto decoded = index == 0 ? first : DecodeFrameAsset(a_factory, a_plan.frames[index].path);
+			const auto sampleDuration = static_cast<LONGLONG>(10'000'000 / frameRate);
+			std::uint64_t previousTick = 0;
+			DecodedFrame previousFrame = first;
+			for (std::size_t index = 0; index < timeline.size(); ++index) {
+				auto decoded = index == 0 ? first : DecodeOutputFrame(a_factory, a_plan, index);
 				if (decoded.width != first.width || decoded.height != first.height) {
 					throw std::runtime_error("Source frame dimensions changed during the sequence.");
 				}
-
-				std::uint64_t durationUs = fallbackDurationUs;
-				if (index + 1 < a_plan.frames.size() &&
-					a_plan.frames[index + 1].timestampUs > a_plan.frames[index].timestampUs) {
-					durationUs = a_plan.frames[index + 1].timestampUs - a_plan.frames[index].timestampUs;
-					fallbackDurationUs = durationUs;
+				const auto tick = a_plan.timeline.frameTicks[index];
+				for (auto missingTick = previousTick + 1; index > 0 && missingTick < tick; ++missingTick) {
+					WriteFrameSample(writer.Get(), streamIndex, previousFrame,
+						static_cast<LONGLONG>(missingTick) * sampleDuration, sampleDuration);
 				}
-
-				ComPtr<IMFMediaBuffer> buffer;
-				Check(MFCreateMemoryBuffer(
-					static_cast<DWORD>(decoded.pixels.size()),
-					buffer.GetAddressOf()),
-					"MFCreateMemoryBuffer");
-				BYTE* destination = nullptr;
-				Check(buffer->Lock(&destination, nullptr, nullptr), "IMFMediaBuffer::Lock");
-				std::copy(decoded.pixels.begin(), decoded.pixels.end(), destination);
-				Check(buffer->Unlock(), "IMFMediaBuffer::Unlock");
-				Check(buffer->SetCurrentLength(static_cast<DWORD>(decoded.pixels.size())), "Set sample length");
-
-				ComPtr<IMFSample> sample;
-				Check(MFCreateSample(sample.GetAddressOf()), "MFCreateSample");
-				Check(sample->AddBuffer(buffer.Get()), "IMFSample::AddBuffer");
-				const auto normalizedUs = a_plan.frames[index].timestampUs >= firstTimestamp ?
-					a_plan.frames[index].timestampUs - firstTimestamp : 0;
-				Check(sample->SetSampleTime(static_cast<LONGLONG>(normalizedUs * 10)), "Set sample time");
-				Check(sample->SetSampleDuration(static_cast<LONGLONG>(durationUs * 10)), "Set sample duration");
-				Check(writer->WriteSample(streamIndex, sample.Get()), "IMFSinkWriter::WriteSample");
+				WriteFrameSample(writer.Get(), streamIndex, decoded,
+					static_cast<LONGLONG>(tick) * sampleDuration, sampleDuration);
+				previousTick = tick;
+				previousFrame = std::move(decoded);
+			}
+			for (auto trailingTick = previousTick + 1; trailingTick <= a_plan.timeline.finalTick; ++trailingTick) {
+				WriteFrameSample(writer.Get(), streamIndex, previousFrame,
+					static_cast<LONGLONG>(trailingTick) * sampleDuration, sampleDuration);
 			}
 
 			Check(writer->Finalize(), "IMFSinkWriter::Finalize");
@@ -408,16 +752,39 @@ namespace CSXCaptureCompanion
 
 	bool VideoComposer::Queue(const std::filesystem::path& a_sequenceDirectory)
 	{
-		const auto current = state.load(std::memory_order_acquire);
-		if (current == ComposeState::kQueued || current == ComposeState::kEncoding) {
+		std::lock_guard workerLock(workerMutex);
+		if (workerActive) {
 			ShowNotification("Video composer is busy");
 			return false;
 		}
-		SetStatus(ComposeState::kQueued, "Video composition queued.");
-		ShowNotification("Video composition queued");
-		worker = std::jthread([this, sequenceDirectory = a_sequenceDirectory] {
-			Run(sequenceDirectory);
-		});
+		workerActive = true;
+		try {
+			SetStatus(ComposeState::kQueued, "Video composition queued.");
+			ShowNotification("Video composition queued");
+			worker = std::jthread([this, sequenceDirectory = a_sequenceDirectory] {
+				try {
+					Run(sequenceDirectory);
+				} catch (const std::exception& exception) {
+					SetStatus(ComposeState::kFailed, std::string("Video worker failed unexpectedly: ") + exception.what());
+					SKSE::log::error("{}", GetStatusText());
+				} catch (...) {
+					SetStatus(ComposeState::kFailed, "Video worker failed with an unknown error.");
+					SKSE::log::error("{}", GetStatusText());
+				}
+				std::lock_guard completionLock(workerMutex);
+				workerActive = false;
+			});
+		} catch (const std::exception& exception) {
+			workerActive = false;
+			SetStatus(ComposeState::kFailed, std::string("Video worker could not start: ") + exception.what());
+			ShowNotification("Video composition failed - see CSXCaptureCompanion.log");
+			return false;
+		} catch (...) {
+			workerActive = false;
+			SetStatus(ComposeState::kFailed, "Video worker could not start.");
+			ShowNotification("Video composition failed - see CSXCaptureCompanion.log");
+			return false;
+		}
 		return true;
 	}
 
@@ -449,22 +816,19 @@ namespace CSXCaptureCompanion
 				"CoCreateInstance(WICImagingFactory)");
 
 			const auto plans = ReadManifest(a_sequenceDirectory);
+			const auto encodings = BuildEncodingPlans(a_sequenceDirectory, plans);
 			std::vector<std::filesystem::path> completedOutputs;
-			for (const auto& plan : plans) {
-				const auto baseName = a_sequenceDirectory.filename().wstring() +
-					std::wstring(plan.suffix.begin(), plan.suffix.end());
-				const auto output = a_sequenceDirectory.parent_path() / (baseName + L".mp4");
-				const auto temporary = a_sequenceDirectory.parent_path() / (baseName + L".tmp.mp4");
-				std::error_code ec;
-				std::filesystem::remove(temporary, ec);
-				EncodeStream(factory.Get(), plan, temporary);
+			for (const auto& encoding : encodings) {
+				if (std::filesystem::exists(encoding.temporary))
+					throw std::runtime_error("The selected temporary video path is no longer available.");
+				EncodeStream(factory.Get(), encoding);
 				if (!MoveFileExW(
-						temporary.c_str(),
-						output.c_str(),
-						MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+						encoding.temporary.c_str(),
+						encoding.output.c_str(),
+						MOVEFILE_WRITE_THROUGH)) {
 					throw std::runtime_error("Could not commit the completed MP4 output.");
 				}
-				completedOutputs.push_back(output);
+				completedOutputs.push_back(encoding.output);
 			}
 
 			std::string message = "Completed: ";

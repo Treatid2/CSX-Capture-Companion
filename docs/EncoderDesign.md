@@ -21,10 +21,21 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 
 - `timestampUs` is normalized to zero and converted to 100-nanosecond Media
   Foundation sample times.
-- Each sample lasts until the next written frame. A dropped manifest entry
-  therefore extends the preceding sample without changing playback speed.
-- A Left or Right session produces one `-left.mp4` or `-right.mp4` file.
-- A Both session produces paired `-left.mp4` and `-right.mp4` files.
+- Timestamps must be unsigned, strictly increasing, and representable by Media
+  Foundation. Invalid timelines fail before an output is created.
+- Current manifests admit only CSX's terminal per-frame states. Completed
+  states provide images; explicit failed, cancelled, stopped, rejected, or
+  dropped states provide hold positions. Unknown states fail before planning.
+- The encoder starts with the rounded median scheduled cadence and raises it,
+  up to 120 fps, until every recorded slot has a distinct sample position.
+  Timelines that cannot fit the 60,000-sample bound are rejected.
+- Missing interior and trailing slots duplicate the preceding image. The final
+  scheduled slot receives one complete sample interval, so recorded trailing
+  drops remain visible without shortening playback.
+- A Left or Right session produces one `-left.mp4` or `-right.mp4` file. If that
+  name already exists, a numeric suffix preserves the earlier output.
+- A Both session produces one double-width `-sbs.mp4`. The left eye occupies the
+  left half and the right eye occupies the right half.
 - The first written frame establishes dimensions; a later size change fails the
   composition instead of creating a malformed stream.
 - `audio` remains false and no audio stream is created.
@@ -35,7 +46,18 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 encodes away from Papyrus, the SKSE message callback, and the render thread. A
 second request while queued or encoding is rejected as busy.
 
-Each output is first written as `*.tmp.mp4` beside the frame-set directory. It
-is renamed with write-through semantics only after `IMFSinkWriter::Finalize`
-succeeds. The worker never edits `sequence.json`, never deletes source frame files, and
-never writes into the Skyrim game directory.
+Version 1 owns and joins an active worker during process shutdown so no encoder
+or notification callback can outlive the plugin. Windows codec and filesystem
+calls are synchronous and are not cooperatively cancellable, so bounded shutdown
+is not promised while composition is active. Finish or stop composition before
+quitting Skyrim when immediate process exit matters.
+
+Before encoding, the worker validates every source, output, temporary path, and
+output suffix as one plan. It accepts at most two output streams, bounds the
+manifest and timeline sizes, and consumes only artifacts marked committed by
+CSX. Outputs are unique leaf names beside the frame-set directory and cannot
+alias a source. Each job uses a new temporary name; an unrelated pre-existing
+temporary file is never removed. A temporary output is renamed with
+write-through semantics only after `IMFSinkWriter::Finalize` succeeds. The
+worker never edits `sequence.json`, never deletes source frame files, and never
+writes into the Skyrim game directory.

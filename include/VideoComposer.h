@@ -43,6 +43,8 @@ namespace CSXCaptureCompanion
 		void SetStatus(ComposeState a_state, std::string a_text);
 
 		std::atomic<ComposeState> state{ ComposeState::kIdle };
+		mutable std::mutex workerMutex;
+		bool workerActive{ false };
 		mutable std::mutex statusMutex;
 		std::string statusText{ "No video composition has been requested." };
 		std::jthread worker;
