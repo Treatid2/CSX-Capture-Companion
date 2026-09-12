@@ -27,6 +27,7 @@ function Write-TestManifest {
 		[Parameter(Mandatory)] [string[]] $Suffixes,
 		[Parameter(Mandatory)] [object[]] $Timestamps,
 		[Parameter(Mandatory)] [string[]] $ArtifactPaths,
+		[string[]] $Views = @(),
 		[string[]] $States = @(),
 		[bool] $Committed = $true
 	)
@@ -35,6 +36,9 @@ function Write-TestManifest {
 	}
 	if ($States.Count -ne 0 -and $States.Count -ne $Timestamps.Count) {
 		throw 'Each explicitly stated test child must have one timestamp.'
+	}
+	if ($Views.Count -ne 0 -and $Views.Count -ne $Suffixes.Count) {
+		throw 'Each explicitly stated test output must have one view.'
 	}
 	New-Item -ItemType Directory -Force -Path $Sequence | Out-Null
 	$children = @()
@@ -57,7 +61,7 @@ function Write-TestManifest {
 		}
 	}
 	$outputs = for ($index = 0; $index -lt $Suffixes.Count; $index++) {
-		$view = if ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
+		$view = if ($Views.Count -ne 0) { $Views[$index] } elseif ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
 		[ordered]@{ view = $view; nameSuffix = $Suffixes[$index] }
 	}
 	$written = @($children | Where-Object { $_.state -eq 'completed' -or $_.state -eq 'completed_with_warnings' }).Count
@@ -67,7 +71,7 @@ function Write-TestManifest {
 		sessionId = 'fixture-session'
 		requestId = 'fixture-sequence'
 		state = 'final'
-		capture = [ordered]@{ outputs = @($outputs) }
+		effective = [ordered]@{ outputs = @($outputs) }
 		updatedUtc = '2026-09-09T00:00:00.000Z'
 		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; written = $written; dropped = $dropped; failed = 0; inFlight = 0 }
 		children = $children
@@ -204,7 +208,7 @@ $manifest = [ordered]@{
 	sessionId = 'smoke-session'
 	requestId = 'smoke-sequence'
 	state = 'final'
-	capture = [ordered]@{
+	effective = [ordered]@{
 		outputs = @(
 			[ordered]@{ view = 'left_eye'; nameSuffix = 'left' },
 			[ordered]@{ view = 'right_eye'; nameSuffix = 'right' }
@@ -253,17 +257,49 @@ foreach ($monoOutput in @('CS_sequence_smoke_1-left.mp4', 'CS_sequence_smoke_1-r
 	}
 }
 
+$largeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_large_stereo'
+$largeLeft = Join-Path $largeSequence 'frame_000001_left.bmp'
+$largeRight = Join-Path $largeSequence 'frame_000001_right.bmp'
+New-Item -ItemType Directory -Force -Path $largeSequence | Out-Null
+foreach ($fixture in @(
+	@{ Path = $largeLeft; Color = [System.Drawing.Color]::Crimson },
+	@{ Path = $largeRight; Color = [System.Drawing.Color]::SeaGreen }
+)) {
+	$bitmap = [System.Drawing.Bitmap]::new(2592, 2592)
+	try {
+		$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+		try { $graphics.Clear($fixture.Color) } finally { $graphics.Dispose() }
+		$bitmap.Save($fixture.Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+	} finally {
+		$bitmap.Dispose()
+	}
+}
+Write-TestManifest -Sequence $largeSequence -Suffixes @('left', 'right') `
+	-Timestamps @([uint64]0) -ArtifactPaths @($largeLeft, $largeRight)
+Invoke-CompositionWithSampleCount -Sequence $largeSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_large_stereo-sbs.mp4') -ExpectedCount 1
+
 if ((Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash -ne $oldTemporaryHash) {
 	throw 'Composition changed a pre-existing predictable temporary file.'
 }
 
-& $Executable --race $sequence
+$raceSequence = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race'
+Copy-Item -LiteralPath $sequence -Destination $raceSequence -Recurse
+& $Executable --race $raceSequence
 if ($LASTEXITCODE -ne 0) {
 	throw "Concurrent composer admission test failed with exit code $LASTEXITCODE."
 }
-$numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
-if (-not (Test-Path -LiteralPath $numberedOutput -PathType Leaf)) {
-	throw 'Concurrent composition did not preserve the original SBS output with a numbered filename.'
+$numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race-sbs-2.mp4'
+if (Test-Path -LiteralPath $numberedOutput -PathType Leaf) {
+	throw 'Idempotent composition unexpectedly created a numbered duplicate output.'
+}
+& $Executable $sequence
+if ($LASTEXITCODE -ne 0) {
+	throw "Idempotent repeat composition failed with exit code $LASTEXITCODE."
+}
+$repeatOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
+if (Test-Path -LiteralPath $repeatOutput -PathType Leaf) {
+	throw 'Repeat composition unexpectedly created a numbered duplicate output.'
 }
 
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
@@ -336,6 +372,19 @@ $duplicateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_duplicate'
 Write-TestManifest -Sequence $duplicateSequence -Suffixes @('left', 'LEFT') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName)
 Invoke-ExpectedFailure -Sequence $duplicateSequence
 
+$legacyRedundantSequence = Join-Path $resolvedWorkRoot 'CS_sequence_redundant_stereo'
+Write-TestManifest -Sequence $legacyRedundantSequence -Suffixes @('side_by_side', 'left', 'right') `
+	-Views @('side_by_side', 'left_eye', 'right_eye') -Timestamps @([uint64]1000) `
+	-ArtifactPaths @($leftSource.FullName, $leftSource.FullName, $rightSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $legacyRedundantSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_redundant_stereo-sbs.mp4') -ExpectedCount 1
+
+$singleSbsSequence = Join-Path $resolvedWorkRoot 'CS_sequence_single_sbs'
+Write-TestManifest -Sequence $singleSbsSequence -Suffixes @('sbs') -Views @('side_by_side') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $singleSbsSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_single_sbs-sbs.mp4') -ExpectedCount 1
+
 $tooManyOutputsSequence = Join-Path $resolvedWorkRoot 'CS_sequence_too_many_outputs'
 Write-TestManifest -Sequence $tooManyOutputsSequence -Suffixes @('left', 'right', 'combined') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName, $leftSource.FullName)
 Invoke-ExpectedFailure -Sequence $tooManyOutputsSequence
@@ -405,16 +454,13 @@ $aliasSource = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left.mp4'
 Copy-Item -LiteralPath $leftSource.FullName -Destination $aliasSource
 $aliasHash = (Get-FileHash -LiteralPath $aliasSource -Algorithm SHA256).Hash
 Write-TestManifest -Sequence $aliasSequence -Suffixes @('left') -Timestamps @([uint64]1000) -ArtifactPaths @($aliasSource)
-& $Executable $aliasSequence
-if ($LASTEXITCODE -ne 0) {
-	throw 'Composer could not avoid an existing source/output name collision.'
-}
+Invoke-ExpectedFailure -Sequence $aliasSequence
 if ((Get-FileHash -LiteralPath $aliasSource -Algorithm SHA256).Hash -ne $aliasHash) {
 	throw 'Composition changed a source file that occupied the default output name.'
 }
 $aliasOutput = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left-2.mp4'
-if (-not (Test-Path -LiteralPath $aliasOutput -PathType Leaf)) {
-	throw 'Composer did not select a non-conflicting final output name.'
+if (Test-Path -LiteralPath $aliasOutput -PathType Leaf) {
+	throw 'Rejected source/output collision created a numbered output.'
 }
 
 foreach ($source in $sourceFiles) {
