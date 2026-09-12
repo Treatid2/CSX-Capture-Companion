@@ -21,9 +21,7 @@ namespace CSXCaptureCompanion
 	class CaptureController final
 	{
 	public:
-		CaptureController(
-			ScreenshotDispatch a_dispatch,
-			ComposeRequest a_compose,
+		CaptureController(ScreenshotDispatch a_dispatch, ComposeRequest a_compose,
 			CaptureNotification a_notify);
 		~CaptureController();
 
@@ -62,9 +60,13 @@ namespace CSXCaptureCompanion
 		void Process(Command a_command);
 		void PollCapture();
 		void PollScreenshots();
-		void TryComposePending();
+		void HandleCaptureUpdate(const CaptureUpdate& a_update);
+		void TryComposePending(const CaptureUpdate& a_update);
+		[[nodiscard]] bool HasPollableReceipts() const;
 
 		static constexpr std::size_t kMaximumQueuedCommands = 16;
+		static constexpr std::size_t kMaximumPendingScreenshots = 16;
+		static constexpr std::size_t kMaximumSequencePollFailures = 4;
 		ScreenshotDispatch dispatch;
 		ComposeRequest compose;
 		CaptureNotification notify;
@@ -74,7 +76,10 @@ namespace CSXCaptureCompanion
 		std::deque<Command> commands;
 		std::deque<PendingScreenshot> pendingScreenshots;
 		bool stopping{ false };
-		bool composePending{ false };
+		std::string pendingComposeRequestId;
+		std::size_t sequencePollFailures{ 0 };
+		bool sequenceReceiptUnavailable{ false };
+		ReceiptFailure unavailableFailure{ ReceiptFailure::kNone };
 		std::jthread worker;
 	};
 }

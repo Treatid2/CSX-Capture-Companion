@@ -233,12 +233,37 @@ namespace
 		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
 			       "The acknowledged terminal capture did not retain its manifest.");
 	}
+
+	bool TestPermanentRefreshClassification()
+	{
+		CaptureSession session([](json request) {
+			if (request.at("action") == "sequence_start")
+				return json{ { "ok", true }, { "result", { { "requestId", "missing" } } } };
+			return json{
+				{ "ok", false },
+				{ "error", { { "code", "request_not_found" }, { "retryable", false } } },
+			};
+		});
+
+		if (!Check(session.Toggle(StartRequest()),
+				"Could not establish the missing-request fixture."))
+			return false;
+		const auto update = session.RefreshUpdate();
+		return Check(update.requestId == "missing",
+				   "The failed refresh lost request custody.") &&
+		       Check(update.failure ==
+						 CSXCaptureCompanion::ReceiptFailure::kPermanent,
+				   "request_not_found was not classified as permanent.") &&
+		       Check(session.ActiveRequestId() == "missing",
+				   "A failed refresh silently cleared custody.");
+	}
 }
 
 int main()
 {
 	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
 	                    TestUnusableStopReceipt() && TestConcurrentToggle() &&
-	                    TestRefreshThenSuccessorStart() && TestToggleDoesNotRestartTerminalCapture();
+	                    TestRefreshThenSuccessorStart() && TestToggleDoesNotRestartTerminalCapture() &&
+	                    TestPermanentRefreshClassification();
 	return passed ? 0 : 1;
 }

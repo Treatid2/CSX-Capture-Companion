@@ -3,6 +3,7 @@
 #include <SKSE/SKSE.h>
 
 #include <chrono>
+#include <optional>
 #include <utility>
 
 namespace CSXCaptureCompanion
@@ -82,15 +83,24 @@ namespace CSXCaptureCompanion
 
 	void CaptureController::Run()
 	{
+		std::optional<std::chrono::steady_clock::time_point> nextReceiptPoll;
 		for (;;) {
 			Command command;
 			bool hasCommand = false;
 			{
 				std::unique_lock lock(queueMutex);
-				const auto hasPendingReceipts =
-					!session.ActiveRequestId().empty() || !pendingScreenshots.empty();
-				const auto pollInterval = hasPendingReceipts ? 250ms : 24h;
-				queueCondition.wait_for(lock, pollInterval, [this] { return stopping || !commands.empty(); });
+				if (HasPollableReceipts() && !nextReceiptPoll)
+					nextReceiptPoll = std::chrono::steady_clock::now() + 250ms;
+				if (!HasPollableReceipts())
+					nextReceiptPoll.reset();
+				if (nextReceiptPoll) {
+					queueCondition.wait_until(lock, *nextReceiptPoll, [this] {
+						return stopping || !commands.empty();
+					});
+				} else {
+					queueCondition.wait(lock,
+						[this] { return stopping || !commands.empty(); });
+				}
 				if (stopping)
 					return;
 				if (!commands.empty()) {
@@ -102,9 +112,13 @@ namespace CSXCaptureCompanion
 
 			if (hasCommand)
 				Process(std::move(command));
-			else {
+
+			if (nextReceiptPoll &&
+				std::chrono::steady_clock::now() >= *nextReceiptPoll) {
 				PollCapture();
 				PollScreenshots();
+				nextReceiptPoll =
+					HasPollableReceipts() ? std::optional(std::chrono::steady_clock::now() + 250ms) : std::nullopt;
 			}
 		}
 	}
@@ -112,34 +126,57 @@ namespace CSXCaptureCompanion
 	void CaptureController::Process(Command a_command)
 	{
 		switch (a_command.kind) {
-		case CommandKind::kScreenshot: {
-			auto requestId = AcceptedRequestId(dispatch(std::move(a_command.request)));
-			if (requestId.empty()) {
-				SKSE::log::warn("Screenshot request was not accepted");
-				notify("Screenshot request failed");
-			} else {
-				pendingScreenshots.push_back({ std::move(requestId), 0 });
-				notify("Screenshot queued");
+		case CommandKind::kScreenshot:
+			{
+				if (pendingScreenshots.size() >= kMaximumPendingScreenshots) {
+					SKSE::log::warn("Screenshot receipt capacity is full");
+					notify("Screenshot queue is full; wait for completion");
+					break;
+				}
+				auto requestId = AcceptedRequestId(dispatch(std::move(a_command.request)));
+				if (requestId.empty()) {
+					SKSE::log::warn("Screenshot request was not accepted");
+					notify("Screenshot request failed");
+				} else {
+					pendingScreenshots.push_back({ std::move(requestId), 0 });
+					notify("Screenshot queued");
+				}
+				break;
 			}
-			break;
-		}
 		case CommandKind::kToggle:
-			if (!session.Toggle(std::move(a_command.request))) {
-				SKSE::log::warn("Frame-capture toggle was not accepted");
-				notify("Frame capture command failed");
+			{
+				if (sequenceReceiptUnavailable && !session.ActiveRequestId().empty()) {
+					sequenceReceiptUnavailable = false;
+					sequencePollFailures = 0;
+					if (unavailableFailure == ReceiptFailure::kPermanent) {
+						(void)session.AbandonActiveRequest();
+						unavailableFailure = ReceiptFailure::kNone;
+						notify("Capture record is no longer retained; trigger again to start");
+						break;
+					}
+					notify("Retrying capture status");
+				}
+				const auto update = session.ToggleUpdate(std::move(a_command.request));
+				if (!update.accepted) {
+					SKSE::log::warn("Frame-capture toggle was not accepted");
+					notify("Frame capture command failed");
+				}
+				HandleCaptureUpdate(update);
+				break;
 			}
-			break;
 		case CommandKind::kCompose:
-			PollCapture();
-			if (!session.ActiveRequestId().empty()) {
-				composePending = true;
+			if (const auto active = session.ActiveRequestId(); !active.empty()) {
+				pendingComposeRequestId = active;
 				notify("Composition queued until capture finishes");
+				PollCapture();
 			} else if (!session.LatestManifest().empty()) {
-				composePending = false;
+				pendingComposeRequestId.clear();
 				if (!compose(session.LatestManifest()))
 					SKSE::log::warn("Video composition request was not accepted");
 			} else {
-				SKSE::log::warn("Compose requested without a completed Screenshot API sequence receipt");
+				SKSE::log::warn(
+					"Compose requested without a completed Screenshot API "
+					"sequence receipt");
 				notify("No completed capture is ready");
 			}
 			break;
@@ -193,28 +230,56 @@ namespace CSXCaptureCompanion
 
 	void CaptureController::PollCapture()
 	{
-		if (session.ActiveRequestId().empty())
+		if (session.ActiveRequestId().empty() || sequenceReceiptUnavailable)
 			return;
-		const auto state = session.Refresh();
-		if (state < 0) {
-			SKSE::log::warn("Screenshot API receipt refresh failed; it will be retried");
-			return;
-		}
-		TryComposePending();
+		HandleCaptureUpdate(session.RefreshUpdate());
 	}
 
-	void CaptureController::TryComposePending()
+	void CaptureController::HandleCaptureUpdate(const CaptureUpdate& a_update)
 	{
-		if (!composePending || !session.ActiveRequestId().empty())
+		if (a_update.failure != ReceiptFailure::kNone) {
+			++sequencePollFailures;
+			const bool exhausted = a_update.failure == ReceiptFailure::kPermanent ||
+			                       sequencePollFailures >= kMaximumSequencePollFailures;
+			if (!exhausted)
+				return;
+			sequenceReceiptUnavailable = true;
+			unavailableFailure = a_update.failure;
+			session.MarkUnavailable();
+			SKSE::log::warn(
+				"Capture {} receipt custody is unavailable after {} failed refreshes",
+				a_update.requestId, sequencePollFailures);
+			notify("Capture status unavailable; trigger capture to reset tracking");
+			if (pendingComposeRequestId == a_update.requestId) {
+				pendingComposeRequestId.clear();
+				notify("Composition failed because capture status is unavailable");
+			}
 			return;
-		const auto manifest = session.LatestManifest();
-		if (manifest.empty()) {
-			composePending = false;
+		}
+		sequencePollFailures = 0;
+		sequenceReceiptUnavailable = false;
+		unavailableFailure = ReceiptFailure::kNone;
+		if (a_update.terminal)
+			TryComposePending(a_update);
+	}
+
+	void CaptureController::TryComposePending(const CaptureUpdate& a_update)
+	{
+		if (pendingComposeRequestId.empty() ||
+			pendingComposeRequestId != a_update.requestId || !a_update.terminal)
+			return;
+		pendingComposeRequestId.clear();
+		if (!a_update.hasManifest) {
 			notify("Capture finished without a composable manifest");
 			return;
 		}
-		composePending = false;
-		if (!compose(manifest))
+		if (!compose(a_update.manifest))
 			SKSE::log::warn("Deferred video composition request was not accepted");
+	}
+
+	bool CaptureController::HasPollableReceipts() const
+	{
+		return (!sequenceReceiptUnavailable && !session.ActiveRequestId().empty()) ||
+		       !pendingScreenshots.empty();
 	}
 }
