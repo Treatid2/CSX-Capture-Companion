@@ -203,12 +203,42 @@ namespace
 		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
 			       "The completed manifest was not retained.");
 	}
+
+	bool TestToggleDoesNotRestartTerminalCapture()
+	{
+		std::atomic_int starts{ 0 };
+		CaptureSession session([&](json request) {
+			const auto action = request.at("action").get<std::string>();
+			if (action == "sequence_start") {
+				++starts;
+				return json{ { "ok", true }, { "result", { { "requestId", "A" } } } };
+			}
+			if (action == "request_get") {
+				return json{
+					{ "ok", true },
+					{ "result", {
+						{ "requestId", "A" },
+						{ "state", "stopped" },
+						{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
+					} },
+				};
+			}
+			return json{ { "ok", false } };
+		});
+
+		return Check(session.Toggle(StartRequest()), "Could not establish the capture request.") &&
+		       Check(session.Toggle(StartRequest()), "A terminal capture was not acknowledged by the toggle.") &&
+		       Check(starts == 1, "A stop toggle restarted a capture that had just become terminal.") &&
+		       Check(session.ActiveRequestId().empty(), "A terminal capture remained active after acknowledgement.") &&
+		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
+			       "The acknowledged terminal capture did not retain its manifest.");
+	}
 }
 
 int main()
 {
 	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
 	                    TestUnusableStopReceipt() && TestConcurrentToggle() &&
-	                    TestRefreshThenSuccessorStart();
+	                    TestRefreshThenSuccessorStart() && TestToggleDoesNotRestartTerminalCapture();
 	return passed ? 0 : 1;
 }

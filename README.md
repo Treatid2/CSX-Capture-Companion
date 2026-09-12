@@ -13,13 +13,16 @@ sets. Audio is outside the first version.
 - **Toggle Frame Capture** lesser power: starts or stops a lossless CSX frame set.
 - **Compose Latest Capture** lesser power: queues the latest completed frame set
   for asynchronous MP4 composition.
-- MCM toggles install or remove those powers and select Left, Right, or Both eyes.
+- MCM toggles install or remove those powers and reports capture/composer state.
 
-The 0.1.1 demonstrator requests PNG stills and a bounded 300-frame BMP
-sequence sampled every 12 rendered game frames. It uses one eye output or two
-synchronized Left/Right outputs, disables clipboard and CSX preview packaging,
-records backpressure in the manifest, and never starts a second sequence while
-the first receipt is active.
+The 0.1.1 demonstrator asks CSX to expand its current settings for both stills
+and sequences. Screenshot eye/format and Frame Capture eye/format/cadence
+therefore have one owner: the CSX menu. The Start/Stop power requests CSX's
+advertised 10,000-frame safety ceiling so a short configured test sequence does
+not turn a manual recording off; the player normally stops it first. The
+companion disables CSX preview packaging, records backpressure in the manifest,
+tolerates capture gaps during cell transitions, and never starts a second
+sequence while the first receipt is active or has only just become terminal.
 
 The native plugin discovers CSX's `CSXR` service registry through SKSE
 messaging, queries `csx.screenshot` major version 1, and sends the same
@@ -43,16 +46,29 @@ encodes H.264 in an MP4 container. Encoding never runs on the render thread,
 source frames are retained, and output is committed only after finalization.
 
 Left and Right sessions produce one `-left.mp4` or `-right.mp4` beside the frame
-set. Both-eye sessions produce one double-width `-sbs.mp4`, with the left eye in
-the left half and the right eye in the right half. Existing outputs are
-preserved with a numbered filename. Manifest timestamps drive sample timing, so
-dropped frames—including drops after the final written image—repeat the
-preceding image rather than silently changing playback speed. The cadence is
-raised when necessary to keep every recorded slot distinct; malformed,
-excessive, or non-monotonic timelines are rejected before any output is
-created. Unknown child states are rejected rather than interpreted as dropped
-frames. Only bounded manifests and explicitly committed artifacts are consumed.
-Version 1 has no audio.
+set. Both-eye sessions produce one half-SBS-compatible `-sbs.mp4`, with the left
+eye in the left half and the right eye in the right half. Each eye is scaled
+proportionally when necessary to keep the encoded canvas within 3840x2160; the
+lossless source frames are never changed. Existing outputs are preserved with a
+deterministic name; composing the same manifest again reports the existing
+video instead of encoding a numbered duplicate.
+
+The composer also accepts the exact redundant three-output shape written by
+pre-release CSX builds (SBS plus matching Left and Right streams). It uses the
+lossless Left/Right pair and ignores only the redundant SBS copy; unrelated or
+ambiguous extra outputs remain a hard failure.
+
+The H.264 encoder uses quality-based variable bitrate at maximum quality and
+maximum quality-over-speed. Output files can therefore be large, especially for
+detailed high-resolution VR captures. Manifest timestamps drive sample timing,
+so dropped frames—including drops after the final written image—repeat the
+preceding image rather than silently changing playback speed. Composition
+cannot restore motion that CSX did not capture. The cadence is raised only when
+necessary to keep every recorded slot distinct; malformed, excessive, or
+non-monotonic timelines are rejected before any output is created. Unknown
+child states are rejected rather than interpreted as dropped frames. Only
+bounded manifests and explicitly committed artifacts are consumed. Version 1
+has no audio.
 
 ## Build status
 

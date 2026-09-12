@@ -21,6 +21,7 @@ namespace CSXCaptureCompanion
 
 		[[nodiscard]] std::int32_t Refresh();
 		[[nodiscard]] bool Toggle(nlohmann::json a_startRequest);
+		[[nodiscard]] std::int32_t CachedState() const;
 		[[nodiscard]] std::filesystem::path LatestManifest() const;
 		[[nodiscard]] std::string ActiveRequestId() const;
 

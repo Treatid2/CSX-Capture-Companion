@@ -1,4 +1,4 @@
-#include "CaptureSession.h"
+#include "CaptureController.h"
 #include "CSXServiceAPI.h"
 #include "CSXScreenshotAPI.h"
 #include "VideoComposer.h"
@@ -7,6 +7,7 @@
 #include <SKSE/SKSE.h>
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -18,8 +19,8 @@ namespace
 	using json = nlohmann::json;
 
 	std::atomic<const CSX::ScreenshotAPI::Interface001*> g_screenshot{ nullptr };
-	std::atomic_int g_eye{ 0 };
 	std::atomic_uint64_t g_commandSequence{ 1 };
+	constexpr std::uint32_t kManualCaptureFrameLimit = 10'000;
 	void ShowInGameNotification(std::string a_message)
 	{
 		if (auto* taskInterface = SKSE::GetTaskInterface()) {
@@ -85,10 +86,15 @@ namespace
 		}
 	}
 
-	CSXCaptureCompanion::CaptureSession& CaptureState()
+	CSXCaptureCompanion::CaptureController& CaptureState()
 	{
-		static CSXCaptureCompanion::CaptureSession session(Dispatch);
-		return session;
+		static CSXCaptureCompanion::CaptureController controller(
+			Dispatch,
+			[](const std::filesystem::path& a_manifest) {
+				return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(a_manifest);
+			},
+			CSXCaptureCompanion::ShowNotification);
+		return controller;
 	}
 
 	bool ConnectToCSX()
@@ -135,69 +141,29 @@ namespace
 		return true;
 	}
 
-	std::int32_t SanitizeEye(std::int32_t a_eye)
-	{
-		return a_eye == 1 || a_eye == 2 ? a_eye : 0;
-	}
-
-	json CaptureDescriptor(std::int32_t a_eye, std::string_view a_format)
-	{
-		json outputs = json::array();
-		auto append = [&](std::string_view a_view, std::string_view a_suffix) {
-			outputs.push_back({
-				{ "view", a_view },
-				{ "encoding", { { "format", a_format }, { "colourContract", "sdr_srgb" } } },
-				{ "nameSuffix", a_suffix },
-			});
-		};
-		if (a_eye == 2) {
-			append("left_eye", "left");
-			append("right_eye", "right");
-		} else if (a_eye == 1) {
-			append("right_eye", "right");
-		} else {
-			append("left_eye", "left");
-		}
-		return {
-			{ "source", { { "kind", "hmd_submission" }, { "fallback", "reject" } } },
-			{ "outputs", std::move(outputs) },
-			{ "destination", { { "policy", "settings_default" }, { "overwrite", "never" } } },
-			{ "clipboard", "none" },
-			{ "tags", { { "producer", "CSX Capture Companion" } } },
-		};
-	}
-
 	bool IsAvailable(RE::StaticFunctionTag*)
 	{
 		return g_screenshot.load(std::memory_order_acquire) != nullptr;
 	}
 
-	void SetEye(RE::StaticFunctionTag*, std::int32_t a_eye)
-	{
-		g_eye.store(SanitizeEye(a_eye), std::memory_order_release);
-	}
-
 	bool TakeScreenshot(RE::StaticFunctionTag*)
 	{
-		const auto response = Dispatch({
-			{ "action", "capture" }, { "useSettings", false },
-			{ "capture", CaptureDescriptor(g_eye.load(std::memory_order_acquire), "png") },
+		return CaptureState().QueueScreenshot({
+			{ "action", "capture" }, { "useSettings", true },
 		});
-		return !CSXCaptureCompanion::AcceptedRequestId(response).empty();
 	}
 
 	bool ToggleFrameSequence(RE::StaticFunctionTag*)
 	{
 		if (!g_screenshot.load(std::memory_order_acquire))
 			return false;
-		return CaptureState().Toggle({
+		return CaptureState().QueueToggle({
 			{ "action", "sequence_start" },
 			{ "sequence", {
-				{ "frameCount", 300 }, { "useSettings", false },
-				{ "schedule", { { "basis", "game_frames" }, { "intervalFrames", 12 } } },
-				{ "backpressure", { { "policy", "skip" }, { "maximumConsecutiveSkips", 5 } } },
+				{ "frameCount", kManualCaptureFrameLimit },
+				{ "useSettings", true },
+				{ "backpressure", { { "policy", "skip" }, { "maximumConsecutiveSkips", 0 } } },
 				{ "failurePolicy", "continue" },
-				{ "capture", CaptureDescriptor(g_eye.load(std::memory_order_acquire), "bmp") },
 				{ "packaging", { { "frameManifest", true }, { "previewVideo", { { "requested", false } } } } },
 			} },
 		});
@@ -207,19 +173,12 @@ namespace
 	{
 		if (!g_screenshot.load(std::memory_order_acquire))
 			return -1;
-		return CaptureState().Refresh();
+		return CaptureState().CaptureState();
 	}
 
 	bool ComposeLatestVideo(RE::StaticFunctionTag*)
 	{
-		(void)CaptureState().Refresh();
-		const auto manifest = CaptureState().LatestManifest();
-		if (manifest.empty()) {
-			SKSE::log::warn("Compose requested without a completed Screenshot API sequence receipt");
-			CSXCaptureCompanion::ShowNotification("No completed capture is ready");
-			return false;
-		}
-		return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(manifest);
+		return CaptureState().QueueCompose();
 	}
 
 	std::int32_t GetComposeState(RE::StaticFunctionTag*)
@@ -235,7 +194,6 @@ namespace
 	bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm)
 	{
 		a_vm->RegisterFunction("IsAvailable", "CSXCaptureNative", IsAvailable);
-		a_vm->RegisterFunction("SetEye", "CSXCaptureNative", SetEye);
 		a_vm->RegisterFunction("TakeScreenshot", "CSXCaptureNative", TakeScreenshot);
 		a_vm->RegisterFunction("ToggleFrameSequence", "CSXCaptureNative", ToggleFrameSequence);
 		a_vm->RegisterFunction("GetCaptureState", "CSXCaptureNative", GetCaptureState);

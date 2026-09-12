@@ -150,6 +150,11 @@ namespace CSXCaptureCompanion
 	bool CaptureSession::Toggle(json a_startRequest)
 	{
 		std::lock_guard operationLock(operationMutex);
+		bool hadActiveRequest = false;
+		{
+			std::lock_guard stateLock(stateMutex);
+			hadActiveRequest = !activeRequestId.empty();
+		}
 		(void)RefreshLocked();
 
 		std::string requestId;
@@ -177,6 +182,8 @@ namespace CSXCaptureCompanion
 			lastState = code;
 			return true;
 		}
+		if (hadActiveRequest)
+			return true;
 
 		const auto response = dispatch(std::move(a_startRequest));
 		requestId = AcceptedRequestId(response);
@@ -187,6 +194,12 @@ namespace CSXCaptureCompanion
 		activeRequestId = std::move(requestId);
 		lastState = 1;
 		return true;
+	}
+
+	std::int32_t CaptureSession::CachedState() const
+	{
+		std::lock_guard stateLock(stateMutex);
+		return lastState;
 	}
 
 	std::filesystem::path CaptureSession::LatestManifest() const
