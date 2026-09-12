@@ -205,7 +205,7 @@ namespace
 
 	void OnSKSEMessage(SKSE::MessagingInterface::Message* a_message)
 	{
-		if (a_message && (a_message->type == SKSE::MessagingInterface::kPostLoad ||
+		if (a_message && (a_message->type == SKSE::MessagingInterface::kPostPostLoad ||
 		                  a_message->type == SKSE::MessagingInterface::kDataLoaded))
 			(void)ConnectToCSX();
 	}
