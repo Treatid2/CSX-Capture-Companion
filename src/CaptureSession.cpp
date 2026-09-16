@@ -10,29 +10,6 @@ namespace CSXCaptureCompanion
 
 	namespace
 	{
-		bool IsTerminal(std::string_view a_state)
-		{
-			return a_state == "completed" || a_state == "completed_with_warnings" ||
-			       a_state == "failed" || a_state == "failed_partial" ||
-			       a_state == "rejected" || a_state == "cancelled" ||
-			       a_state == "cancelled_partial" || a_state == "stopped" ||
-			       a_state == "dropped";
-		}
-
-		std::int32_t CaptureStateCode(std::string_view a_state)
-		{
-			if (a_state == "stop_requested" || a_state == "cancel_requested" || a_state == "finalizing")
-				return 2;
-			if (a_state == "completed" || a_state == "completed_with_warnings" || a_state == "stopped")
-				return 3;
-			if (a_state == "failed" || a_state == "failed_partial" || a_state == "rejected" ||
-				a_state == "cancelled" || a_state == "cancelled_partial" || a_state == "dropped")
-				return 4;
-			return a_state == "accepted" || a_state == "waiting_source" ||
-			       a_state == "staged" || a_state == "queued" ||
-			       a_state == "encoding" || a_state == "running" ? 1 : -1;
-		}
-
 		ReceiptFailure TryDecodeReceipt(const json& a_response,
 			std::string_view a_expectedRequestId,
 			std::string& a_state,
@@ -90,6 +67,20 @@ namespace CSXCaptureCompanion
 			}
 		}
 	}  // namespace
+
+	std::int32_t CaptureStateCode(std::string_view a_state) noexcept
+	{
+		if (a_state == "stop_requested" || a_state == "cancel_requested" || a_state == "finalizing")
+			return 2;
+		if (a_state == "completed" || a_state == "completed_with_warnings" || a_state == "stopped")
+			return 3;
+		if (a_state == "failed" || a_state == "failed_partial" || a_state == "rejected" ||
+			a_state == "cancelled" || a_state == "cancelled_partial" || a_state == "dropped")
+			return 4;
+		return a_state == "accepted" || a_state == "waiting_source" ||
+		       a_state == "staged" || a_state == "queued" ||
+		       a_state == "encoding" || a_state == "running" ? 1 : -1;
+	}
 
 	bool IsSuccessfulResponse(const json& a_response) noexcept
 	{
@@ -153,7 +144,7 @@ namespace CSXCaptureCompanion
 		const auto code = CaptureStateCode(state);
 		update.state = code;
 		update.accepted = true;
-		update.terminal = IsTerminal(state);
+		update.terminal = code >= 3;
 		update.hasManifest = hasManifest;
 		if (hasManifest)
 			update.manifest = manifest;
@@ -206,7 +197,7 @@ namespace CSXCaptureCompanion
 			const auto code = CaptureStateCode(state);
 			update.state = code;
 			update.accepted = true;
-			update.terminal = IsTerminal(state);
+			update.terminal = code >= 3;
 			update.hasManifest = hasManifest;
 			if (hasManifest)
 				update.manifest = manifest;
@@ -231,6 +222,8 @@ namespace CSXCaptureCompanion
 
 		std::lock_guard stateLock(stateMutex);
 		activeRequestId = std::move(requestId);
+		// A newer accepted attempt supersedes automatic composition eligibility.
+		latestManifest.clear();
 		lastState = 1;
 		return { .requestId = activeRequestId, .state = 1, .accepted = true };
 	}
@@ -241,6 +234,7 @@ namespace CSXCaptureCompanion
 		std::lock_guard stateLock(stateMutex);
 		auto abandoned = std::move(activeRequestId);
 		activeRequestId.clear();
+		latestManifest.clear();
 		lastState = 0;
 		return abandoned;
 	}

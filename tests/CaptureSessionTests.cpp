@@ -85,8 +85,8 @@ namespace
 		       Check(session.Toggle(StartRequest()), "Could not establish the unusable-stop fixture state.") &&
 		       Check(!session.Toggle(StartRequest()), "An empty stop state was reported as successful.") &&
 		       Check(session.ActiveRequestId() == "A", "An empty stop state changed active request ownership.") &&
-		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/seed/sequence.json"),
-			       "An empty stop state replaced the latest valid manifest.") &&
+		       Check(session.LatestManifest().empty(),
+			       "A newer accepted capture retained implicit seed composition eligibility.") &&
 		       Check(session.Refresh() == 1, "An empty stop state replaced the last valid capture state.");
 	}
 
@@ -200,8 +200,8 @@ namespace
 
 		return Check(starts == 2, "The terminal receipt did not permit one successor start.") &&
 		       Check(session.ActiveRequestId() == "B", "The earlier receipt cleared the successor request.") &&
-		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
-			       "The completed manifest was not retained.");
+		       Check(session.LatestManifest().empty(),
+			       "The successor retained historical automatic composition eligibility.");
 	}
 
 	bool TestToggleDoesNotRestartTerminalCapture()

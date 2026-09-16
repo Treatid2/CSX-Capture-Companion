@@ -14,15 +14,6 @@ namespace CSXCaptureCompanion
 
 	namespace
 	{
-		bool IsTerminal(std::string_view a_state)
-		{
-			return a_state == "completed" || a_state == "completed_with_warnings" ||
-			       a_state == "failed" || a_state == "failed_partial" ||
-			       a_state == "rejected" || a_state == "cancelled" ||
-			       a_state == "cancelled_partial" || a_state == "stopped" ||
-			       a_state == "dropped";
-		}
-
 		bool IsSuccessfulTerminal(std::string_view a_state)
 		{
 			return a_state == "completed" || a_state == "completed_with_warnings";
@@ -149,6 +140,10 @@ namespace CSXCaptureCompanion
 					sequenceReceiptUnavailable = false;
 					sequencePollFailures = 0;
 					if (unavailableFailure == ReceiptFailure::kPermanent) {
+						if (!pendingComposeRequestId.empty()) {
+							pendingComposeRequestId.clear();
+							notify("Composition failed because capture status is unavailable");
+						}
 						(void)session.AbandonActiveRequest();
 						unavailableFailure = ReceiptFailure::kNone;
 						notify("Capture record is no longer retained; trigger again to start");
@@ -165,7 +160,10 @@ namespace CSXCaptureCompanion
 				break;
 			}
 		case CommandKind::kCompose:
-			if (const auto active = session.ActiveRequestId(); !active.empty()) {
+			if (sequenceReceiptUnavailable) {
+				pendingComposeRequestId.clear();
+				notify("Composition failed because capture status is unavailable");
+			} else if (const auto active = session.ActiveRequestId(); !active.empty()) {
 				pendingComposeRequestId = active;
 				notify("Composition queued until capture finishes");
 				PollCapture();
@@ -201,7 +199,8 @@ namespace CSXCaptureCompanion
 			const auto& receipt = response["result"];
 			if (!receipt.contains("requestId") || !receipt["requestId"].is_string() ||
 				receipt["requestId"].get_ref<const std::string&>() != request->requestId ||
-				!receipt.contains("state") || !receipt["state"].is_string()) {
+				!receipt.contains("state") || !receipt["state"].is_string() ||
+				CaptureStateCode(receipt["state"].get_ref<const std::string&>()) < 0) {
 				if (++request->failedPolls >= kMaximumScreenshotPollFailures) {
 					SKSE::log::warn("Screenshot {} returned invalid receipt data", request->requestId);
 					notify("Screenshot status unavailable - see CSXCaptureCompanion.log");
@@ -213,7 +212,7 @@ namespace CSXCaptureCompanion
 			}
 			request->failedPolls = 0;
 			const auto& state = receipt["state"].get_ref<const std::string&>();
-			if (!IsTerminal(state)) {
+			if (CaptureStateCode(state) < 3) {
 				++request;
 				continue;
 			}

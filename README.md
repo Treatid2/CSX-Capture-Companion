@@ -11,8 +11,8 @@ sets. Audio is outside the first version.
 
 - **Capture Screenshot** lesser power: requests one CSX screenshot.
 - **Toggle Frame Capture** lesser power: starts or stops a lossless CSX frame set.
-- **Compose Latest Capture** lesser power: queues the latest completed frame set
-  for asynchronous MP4 composition.
+- **Compose Latest Capture** lesser power: queues the latest accepted frame set
+  for asynchronous MP4 composition once its terminal manifest is available.
 - MCM toggles install or remove those powers and reports capture/composer state.
 
 The 0.1.1 demonstrator asks CSX to expand its current settings for both stills
@@ -23,6 +23,13 @@ not turn a manual recording off; the player normally stops it first. The
 companion disables CSX preview packaging, records backpressure in the manifest,
 tolerates capture gaps during cell transitions, and never starts a second
 sequence while the first receipt is active or has only just become terminal.
+
+A newer accepted recording supersedes the previous recording's automatic
+composition eligibility. If it fails without a final manifest, Compose refuses
+instead of selecting an older frame set. Unavailable receipt custody also
+refuses Compose immediately; use the explicit capture recovery gesture rather
+than assuming an untracked recording has stopped. Invalid receipt states have
+finite retry budgets and never imply that a screenshot was saved.
 
 The native plugin discovers CSX's `CSXR` service registry through SKSE
 messaging, queries `csx.screenshot` major version 1, and sends the same

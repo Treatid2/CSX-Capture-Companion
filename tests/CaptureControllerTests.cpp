@@ -67,7 +67,7 @@ namespace
 		       Check(entered, "The queued screenshot did not reach the dispatch worker.");
 	}
 
-	bool TestScreenshotReceiptReportsCompletion()
+	bool TestScreenshotReceiptReportsCompletion(std::string a_terminal = "completed")
 	{
 		std::atomic_int receiptPolls{ 0 };
 		std::mutex notificationMutex;
@@ -78,7 +78,10 @@ namespace
 				if (action == "capture")
 					return json{ { "ok", true }, { "result", { { "requestId", "still-A" } } } };
 				if (action == "request_get") {
-					const auto state = receiptPolls++ == 0 ? "encoding" : "completed";
+					const std::vector<std::string> states{ "accepted", "waiting_source", "staged", "queued",
+						"encoding", "running", "stop_requested", "cancel_requested", "finalizing" };
+					const auto ordinal = receiptPolls++;
+					const auto state = ordinal < static_cast<int>(states.size()) ? states[ordinal] : a_terminal;
 					return json{
 						{ "ok", true },
 						{ "result", { { "requestId", "still-A" }, { "state", state } } },
@@ -96,10 +99,11 @@ namespace
 				"The screenshot command was not queued.")) {
 			return false;
 		}
+		const auto expected = a_terminal == "completed" ? "Screenshot saved" : "Screenshot failed - see CSXCaptureCompanion.log";
 		const bool completed = WaitFor([&] {
 			std::lock_guard lock(notificationMutex);
-			return std::ranges::find(notifications, "Screenshot saved") != notifications.end();
-		});
+			return std::ranges::find(notifications, expected) != notifications.end();
+		}, 4s);
 		std::lock_guard lock(notificationMutex);
 		return Check(completed, "The screenshot terminal receipt was not reported.") &&
 		       Check(!notifications.empty() && notifications.front() == "Screenshot queued",
@@ -286,6 +290,11 @@ namespace
 					   "Capture finished without a composable manifest") !=
 			       notifications.end();
 		});
+		if (!failedExplicitly || !controller.QueueCompose() || !WaitFor([&] {
+			std::lock_guard lock(resultMutex);
+			return std::ranges::find(notifications, "No completed capture is ready") != notifications.end();
+		}))
+			return Check(false, "Repeated Compose after deferred refusal was not refused.");
 		std::lock_guard lock(resultMutex);
 		return Check(failedExplicitly,
 				   "Capture B's missing manifest was not reported.") &&
@@ -503,15 +512,197 @@ namespace
 				   "its fixed capacity.") &&
 		       Check(accepted == 16, "An over-cap screenshot reached the provider.");
 	}
+
+	bool TestComposeAfterTerminalFailure(bool a_stopFailure, std::string a_failureState)
+	{
+		std::atomic_int starts{ 0 };
+		std::atomic_bool failB{ false };
+		std::mutex resultMutex;
+		std::vector<std::filesystem::path> composed;
+		std::vector<std::string> notifications;
+		CaptureController controller(
+			[&](json request) {
+				const auto action = request.at("action").get<std::string>();
+				if (action == "sequence_start") {
+					const auto ordinal = ++starts;
+					return json{ { "ok", true }, { "result", { { "requestId", ordinal == 1 ? "A" : ordinal == 2 ? "B" : "C" } } } };
+				}
+				const auto id = request.at("requestId").get<std::string>();
+				if (id == "B") {
+					if (failB && (!a_stopFailure || action == "sequence_stop")) {
+						return json{ { "ok", true }, { "result", {
+							{ "requestId", id }, { "state", a_failureState },
+							{ "manifest", { { "status", "failed" }, { "finalPath", nullptr } } },
+							{ "counts", { { "written", 2 } } },
+						} } };
+					}
+					return json{ { "ok", true }, { "result", { { "requestId", id }, { "state", "running" } } } };
+				}
+				return json{ { "ok", true }, { "result", {
+					{ "requestId", id }, { "state", "completed" },
+					{ "manifest", { { "finalPath", std::format("D:/captures/{}/sequence.json", id) } } },
+				} } };
+			},
+			[&](const std::filesystem::path& manifest) {
+				std::lock_guard lock(resultMutex);
+				composed.push_back(manifest);
+				return true;
+			},
+			[&](std::string message) {
+				std::lock_guard lock(resultMutex);
+				notifications.push_back(std::move(message));
+			});
+
+		if (!controller.QueueToggle(StartRequest()) ||
+			!WaitFor([&] { return controller.CaptureState() == 3; }) ||
+			!controller.QueueCompose() || !WaitFor([&] {
+				std::lock_guard lock(resultMutex);
+				return composed.size() == 1;
+			}) || !controller.QueueToggle(StartRequest()) ||
+			!WaitFor([&] { return starts == 2 && controller.CaptureState() == 1; }))
+			return Check(false, "The terminal-failure fixture did not establish A then B.");
+		failB = true;
+		if (a_stopFailure && !controller.QueueToggle(StartRequest()))
+			return false;
+		if (!WaitFor([&] { return controller.CaptureState() == 4; }) ||
+			!controller.QueueCompose() || !controller.QueueCompose() || !WaitFor([&] {
+				std::lock_guard lock(resultMutex);
+				return std::ranges::count(notifications, "No completed capture is ready") == 2;
+			}))
+			return Check(false, "Compose after terminal failure was not refused twice.");
+		{
+			std::lock_guard lock(resultMutex);
+			if (!Check(composed.size() == 1, "A later failure implicitly composed historical A."))
+				return false;
+		}
+		if (!controller.QueueToggle(StartRequest()) ||
+			!WaitFor([&] { return starts == 3 && controller.CaptureState() == 3; }) ||
+			!controller.QueueCompose() || !controller.QueueCompose() || !WaitFor([&] {
+				std::lock_guard lock(resultMutex);
+				return composed.size() == 3;
+			}))
+			return Check(false, "A later successful capture lost repeat composition eligibility.");
+		std::lock_guard lock(resultMutex);
+		return Check(composed[1] == std::filesystem::path("D:/captures/C/sequence.json") &&
+			composed[2] == composed[1], "Successful C did not supersede failed B.");
+	}
+
+	bool TestComposeAfterUnavailableCustody(CSXCaptureCompanion::ReceiptFailure a_failure)
+	{
+		std::atomic_int starts{ 0 };
+		std::atomic_int polls{ 0 };
+		std::atomic_int composed{ 0 };
+		std::atomic_bool recovered{ false };
+		std::atomic_bool stopped{ false };
+		std::mutex resultMutex;
+		std::vector<std::string> notifications;
+		CaptureController controller(
+			[&](json request) {
+				const auto action = request.at("action").get<std::string>();
+				if (action == "sequence_start") {
+					++starts;
+					return json{ { "ok", true }, { "result", { { "requestId", "owned" } } } };
+				}
+				++polls;
+				if (!recovered) {
+					if (a_failure == CSXCaptureCompanion::ReceiptFailure::kInvalid)
+						return json{ { "ok", true }, { "result", { { "requestId", "owned" }, { "state", "unknown" } } } };
+					return json{ { "ok", false }, { "error", { { "code",
+						a_failure == CSXCaptureCompanion::ReceiptFailure::kPermanent ? "request_not_found" : "transport_error" } } } };
+				}
+				if (action == "sequence_stop")
+					stopped = true;
+				return json{ { "ok", true }, { "result", {
+					{ "requestId", "owned" }, { "state", stopped ? "stopped" : "running" },
+					{ "manifest", { { "finalPath", stopped ? json("D:/captures/owned/sequence.json") : json(nullptr) } } },
+				} } };
+			},
+			[&](const std::filesystem::path&) { ++composed; return true; },
+			[&](std::string message) {
+				std::lock_guard lock(resultMutex);
+				notifications.push_back(std::move(message));
+			});
+		if (!controller.QueueToggle(StartRequest()) ||
+			!WaitFor([&] { return controller.CaptureState() == -1; }))
+			return Check(false, "The unavailable-compose fixture did not exhaust custody.");
+		const auto pollsAtFailure = polls.load();
+		if (!controller.QueueCompose() || !controller.QueueCompose() || !WaitFor([&] {
+			std::lock_guard lock(resultMutex);
+			return std::ranges::count(notifications,
+				"Composition failed because capture status is unavailable") == 2;
+		}))
+			return Check(false, "Compose with unavailable custody was not refused immediately.");
+		std::this_thread::sleep_for(300ms);
+		if (!Check(polls == pollsAtFailure && composed == 0 && starts == 1,
+			"Unavailable Compose polled, composed, or replaced its owned capture."))
+			return false;
+		recovered = true;
+		if (!controller.QueueToggle(StartRequest()))
+			return false;
+		if (a_failure == CSXCaptureCompanion::ReceiptFailure::kPermanent) {
+			if (!WaitFor([&] { return controller.CaptureState() == 0; }) ||
+				!controller.QueueCompose() || !WaitFor([&] {
+					std::lock_guard lock(resultMutex);
+					return std::ranges::count(notifications, "No completed capture is ready") == 1;
+				}))
+				return Check(false, "Permanent reset left implicit composition eligibility.");
+		} else if (!WaitFor([&] { return controller.CaptureState() == 3; })) {
+			return Check(false, "Explicit recovery did not stop the same owned capture.");
+		}
+		return Check(starts == 1 && composed == 0, "Recovery resurrected a refused composition.");
+	}
+
+	bool TestUnknownStillStatesRetireAndReuseSlots()
+	{
+		std::atomic_int captures{ 0 };
+		std::atomic_int unavailable{ 0 };
+		std::atomic_int saved{ 0 };
+		std::atomic_int polls{ 0 };
+		CaptureController controller(
+			[&](json request) {
+				if (request.at("action") == "capture")
+					return json{ { "ok", true }, { "result", { { "requestId", std::format("still-{}", ++captures) } } } };
+				++polls;
+				const auto id = request.at("requestId").get<std::string>();
+				return json{ { "ok", true }, { "result", { { "requestId", id },
+					{ "state", id == "still-17" ? "completed" : polls % 2 ? "unknown" : "" } } } };
+			},
+			[](const std::filesystem::path&) { return true; },
+			[&](std::string message) {
+				if (message == "Screenshot status unavailable - see CSXCaptureCompanion.log")
+					++unavailable;
+				if (message == "Screenshot saved")
+					++saved;
+			});
+		for (int i = 0; i < 16; ++i) {
+			if (!controller.QueueScreenshot({ { "action", "capture" } }))
+				return false;
+		}
+		if (!Check(WaitFor([&] { return unavailable == 16; }, 13s),
+			"Unknown/empty still states did not retire all receipt slots.") ||
+			!Check(polls == 16 * 40 && saved == 0, "Malformed still polling was not finitely bounded."))
+			return false;
+		if (!controller.QueueScreenshot({ { "action", "capture" } }))
+			return false;
+		return Check(WaitFor([&] { return captures == 17 && saved == 1; }),
+			"Retired malformed still receipts did not release capacity for a valid capture.");
+	}
 }
 
 int main()
 {
 	return TestCallerNeverWaitsForDispatch() && TestScreenshotReceiptReportsCompletion() &&
+	       TestScreenshotReceiptReportsCompletion("failed") &&
 	       TestStopReceiptIsPolledAndComposed() && TestToggleTerminalResolvesDeferredCompose() &&
 	       TestDeferredComposeDoesNotUseOlderManifest() &&
 	       TestPermanentReceiptFailureRequiresExplicitRecovery() &&
 	       TestTransientReceiptBudgetCanRecover() &&
 	       TestCommandIngressDoesNotStarveReceipts() &&
-	       TestPendingScreenshotCapacityIsBounded() ? 0 : 1;
+	       TestPendingScreenshotCapacityIsBounded() &&
+	       TestComposeAfterTerminalFailure(false, "failed") &&
+	       TestComposeAfterTerminalFailure(true, "failed_partial") &&
+	       TestComposeAfterUnavailableCustody(CSXCaptureCompanion::ReceiptFailure::kPermanent) &&
+	       TestComposeAfterUnavailableCustody(CSXCaptureCompanion::ReceiptFailure::kTransient) &&
+	       TestComposeAfterUnavailableCustody(CSXCaptureCompanion::ReceiptFailure::kInvalid) &&
+	       TestUnknownStillStatesRetireAndReuseSlots() ? 0 : 1;
 }
