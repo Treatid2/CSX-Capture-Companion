@@ -26,6 +26,7 @@ add_commonlibsse_plugin(
     SOURCES
         src/main.cpp
 		src/CaptureController.cpp
+		src/CaptureRuntime.cpp
         src/CaptureSession.cpp
         src/VideoComposer.cpp
 )
@@ -134,13 +135,24 @@ if(BUILD_TESTING)
 		CSXCaptureControllerTests
 		tests/CaptureControllerTests.cpp
 		src/CaptureController.cpp
+		src/CaptureRuntime.cpp
 		src/CaptureSession.cpp
+		src/VideoComposer.cpp
 	)
 	target_compile_features(CSXCaptureControllerTests PRIVATE cxx_std_23)
 	target_include_directories(CSXCaptureControllerTests PRIVATE include)
 	target_compile_definitions(CSXCaptureControllerTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 	target_precompile_headers(CSXCaptureControllerTests PRIVATE include/PCH.h)
-	target_link_libraries(CSXCaptureControllerTests PRIVATE CommonLibSSE::CommonLibSSE)
+	target_link_libraries(
+		CSXCaptureControllerTests
+		PRIVATE
+			CommonLibSSE::CommonLibSSE
+			mfplat
+			mfreadwrite
+			mfuuid
+			windowscodecs
+			ole32
+	)
 	if(MSVC)
 		target_compile_options(CSXCaptureControllerTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
 	endif()

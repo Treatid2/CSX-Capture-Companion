@@ -76,6 +76,7 @@ namespace CSXCaptureCompanion
 		std::deque<Command> commands;
 		std::deque<PendingScreenshot> pendingScreenshots;
 		bool stopping{ false };
+		bool queueSaturationReported{ false };
 		std::string pendingComposeRequestId;
 		std::size_t sequencePollFailures{ 0 };
 		bool sequenceReceiptUnavailable{ false };

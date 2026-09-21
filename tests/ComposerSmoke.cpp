@@ -23,6 +23,12 @@ namespace
 {
 	using Microsoft::WRL::ComPtr;
 
+	CSXCaptureCompanion::VideoComposer& Composer()
+	{
+		static CSXCaptureCompanion::VideoComposer composer;
+		return composer;
+	}
+
 	struct RuntimeScope
 	{
 		~RuntimeScope()
@@ -103,7 +109,7 @@ namespace
 
 	int WaitForComposition(bool a_expectFailure)
 	{
-		auto& composer = CSXCaptureCompanion::VideoComposer::GetSingleton();
+		auto& composer = Composer();
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
 		while (std::chrono::steady_clock::now() < deadline) {
 			const auto state = composer.GetState();
@@ -131,7 +137,7 @@ namespace
 
 	int RunComposition(const std::filesystem::path& a_sequence, bool a_expectFailure)
 	{
-		auto& composer = CSXCaptureCompanion::VideoComposer::GetSingleton();
+		auto& composer = Composer();
 		if (!composer.Queue(a_sequence)) {
 			std::cerr << "Composer rejected the smoke-test sequence before starting its worker.\n";
 			return 3;
@@ -141,7 +147,7 @@ namespace
 
 	int RaceComposition(const std::filesystem::path& a_sequence)
 	{
-		auto& composer = CSXCaptureCompanion::VideoComposer::GetSingleton();
+		auto& composer = Composer();
 		constexpr std::size_t contenderCount = 8;
 		std::barrier gate(static_cast<std::ptrdiff_t>(contenderCount + 1));
 		std::atomic_size_t accepted{ 0 };

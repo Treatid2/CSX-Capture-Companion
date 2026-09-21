@@ -294,8 +294,8 @@ if (Test-Path -LiteralPath $numberedOutput -PathType Leaf) {
 	throw 'Idempotent composition unexpectedly created a numbered duplicate output.'
 }
 & $Executable $sequence
-if ($LASTEXITCODE -ne 0) {
-	throw "Idempotent repeat composition failed with exit code $LASTEXITCODE."
+if ($LASTEXITCODE -eq 0) {
+	throw 'Repeat composition trusted an existing deterministic output without provenance.'
 }
 $repeatOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
 if (Test-Path -LiteralPath $repeatOutput -PathType Leaf) {
@@ -304,6 +304,17 @@ if (Test-Path -LiteralPath $repeatOutput -PathType Leaf) {
 
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
 $rightSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $rightFrames } | Select-Object -First 1
+
+$collisionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision'
+Write-TestManifest -Sequence $collisionSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$collisionOutput = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision-left.mp4'
+Set-Content -LiteralPath $collisionOutput -Value 'unrelated file' -Encoding ascii -NoNewline
+$collisionHash = (Get-FileHash -LiteralPath $collisionOutput -Algorithm SHA256).Hash
+Invoke-ExpectedFailure -Sequence $collisionSequence
+if ((Get-FileHash -LiteralPath $collisionOutput -Algorithm SHA256).Hash -ne $collisionHash) {
+	throw 'Composition changed an unverified deterministic output collision.'
+}
 
 $longSequence = Join-Path $resolvedWorkRoot 'CS_sequence_long_cadence'
 $longTimestamps = @(

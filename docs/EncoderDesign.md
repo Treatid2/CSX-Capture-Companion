@@ -51,11 +51,15 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 `VideoComposer` owns one worker thread and serializes jobs. It decodes and
 encodes away from Papyrus, the SKSE message callback, and the render thread. A
 second request while queued or encoding is rejected as busy.
-Once the deterministic output for a manifest exists, another request reports
-that completed output without encoding a numbered duplicate.
+An existing deterministic output is preserved but never treated as proof of a
+completed composition. Version 1 fails closed because it has no provenance
+record binding arbitrary existing MP4 bytes to the requested manifest. It does
+not overwrite the file or create a numbered duplicate.
 
-Version 1 owns and joins an active worker during process shutdown so no encoder
-or notification callback can outlive the plugin. Windows codec and filesystem
+The production runtime owns the composer before the capture controller and
+destroys the controller first. Its capture worker is therefore stopped and
+joined before the composer or its worker can be destroyed, so no queued capture
+callback can enter destroyed composer state. Windows codec and filesystem
 calls are synchronous and are not cooperatively cancellable, so bounded shutdown
 is not promised while composition is active. Finish or stop composition before
 quitting Skyrim when immediate process exit matters.

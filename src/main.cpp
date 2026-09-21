@@ -1,4 +1,5 @@
 #include "CaptureController.h"
+#include "CaptureRuntime.h"
 #include "CSXServiceAPI.h"
 #include "CSXScreenshotAPI.h"
 #include "VideoComposer.h"
@@ -86,15 +87,11 @@ namespace
 		}
 	}
 
-	CSXCaptureCompanion::CaptureController& CaptureState()
+	CSXCaptureCompanion::CaptureRuntime& Runtime()
 	{
-		static CSXCaptureCompanion::CaptureController controller(
-			Dispatch,
-			[](const std::filesystem::path& a_manifest) {
-				return CSXCaptureCompanion::VideoComposer::GetSingleton().Queue(a_manifest);
-			},
-			CSXCaptureCompanion::ShowNotification);
-		return controller;
+		static CSXCaptureCompanion::CaptureRuntime runtime(
+			Dispatch, CSXCaptureCompanion::ShowNotification);
+		return runtime;
 	}
 
 	bool ConnectToCSX()
@@ -148,7 +145,7 @@ namespace
 
 	bool TakeScreenshot(RE::StaticFunctionTag*)
 	{
-		return CaptureState().QueueScreenshot({
+		return Runtime().Capture().QueueScreenshot({
 			{ "action", "capture" }, { "useSettings", true },
 		});
 	}
@@ -157,7 +154,7 @@ namespace
 	{
 		if (!g_screenshot.load(std::memory_order_acquire))
 			return false;
-		return CaptureState().QueueToggle({
+		return Runtime().Capture().QueueToggle({
 			{ "action", "sequence_start" },
 			{ "sequence", {
 				{ "frameCount", kManualCaptureFrameLimit },
@@ -173,22 +170,22 @@ namespace
 	{
 		if (!g_screenshot.load(std::memory_order_acquire))
 			return -1;
-		return CaptureState().CaptureState();
+		return Runtime().Capture().CaptureState();
 	}
 
 	bool ComposeLatestVideo(RE::StaticFunctionTag*)
 	{
-		return CaptureState().QueueCompose();
+		return Runtime().Capture().QueueCompose();
 	}
 
 	std::int32_t GetComposeState(RE::StaticFunctionTag*)
 	{
-		return static_cast<std::int32_t>(CSXCaptureCompanion::VideoComposer::GetSingleton().GetState());
+		return static_cast<std::int32_t>(Runtime().Composer().GetState());
 	}
 
 	std::string GetComposeStatus(RE::StaticFunctionTag*)
 	{
-		return CSXCaptureCompanion::VideoComposer::GetSingleton().GetStatusText();
+		return Runtime().Composer().GetStatusText();
 	}
 
 	bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm)

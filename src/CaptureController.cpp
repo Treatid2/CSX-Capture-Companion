@@ -62,12 +62,26 @@ namespace CSXCaptureCompanion
 
 	bool CaptureController::Enqueue(Command a_command)
 	{
+		bool reportSaturation = false;
+		bool accepted = false;
 		{
 			std::lock_guard lock(queueMutex);
-			if (stopping || commands.size() >= kMaximumQueuedCommands)
+			if (stopping)
 				return false;
-			commands.push_back(std::move(a_command));
+			if (commands.size() >= kMaximumQueuedCommands) {
+				reportSaturation = !queueSaturationReported;
+				queueSaturationReported = true;
+			} else {
+				commands.push_back(std::move(a_command));
+				accepted = true;
+			}
 		}
+		if (reportSaturation) {
+			notify("Capture command rejected - companion queue is full");
+			SKSE::log::warn("Capture command rejected because the companion queue is full");
+		}
+		if (!accepted)
+			return false;
 		queueCondition.notify_one();
 		return true;
 	}
@@ -97,6 +111,8 @@ namespace CSXCaptureCompanion
 				if (!commands.empty()) {
 					command = std::move(commands.front());
 					commands.pop_front();
+					if (commands.size() < kMaximumQueuedCommands)
+						queueSaturationReported = false;
 					hasCommand = true;
 				}
 			}

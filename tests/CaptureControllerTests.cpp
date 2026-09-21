@@ -1,4 +1,5 @@
 #include "CaptureController.h"
+#include "CaptureRuntime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +66,74 @@ namespace
 		return Check(queued, "The screenshot command was not queued.") &&
 		       Check(elapsed < 100ms, "The screenshot caller waited for transport dispatch.") &&
 		       Check(entered, "The queued screenshot did not reach the dispatch worker.");
+	}
+
+	bool TestQueueSaturationIsReportedOnce()
+	{
+		std::atomic_bool dispatchEntered{ false };
+		std::atomic_bool releaseDispatch{ false };
+		std::atomic_int saturationNotices{ 0 };
+		CaptureController controller(
+			[&](json) {
+				dispatchEntered = true;
+				while (!releaseDispatch.load())
+					std::this_thread::sleep_for(5ms);
+				return json{ { "ok", true }, { "result", { { "requestId", "blocked" } } } };
+			},
+			[](const std::filesystem::path&) { return true; },
+			[&](std::string message) {
+				if (message == "Capture command rejected - companion queue is full")
+					++saturationNotices;
+			});
+
+		if (!controller.QueueScreenshot({ { "action", "capture" } }) ||
+			!WaitFor([&] { return dispatchEntered.load(); })) {
+			releaseDispatch = true;
+			return Check(false, "The saturation fixture did not block its worker.");
+		}
+		for (int index = 0; index < 16; ++index) {
+			if (!controller.QueueScreenshot({ { "action", "capture" } })) {
+				releaseDispatch = true;
+				return Check(false, "The bounded queue rejected a command before reaching capacity.");
+			}
+		}
+		const bool firstRejected = !controller.QueueScreenshot({ { "action", "capture" } });
+		const bool repeatRejected = !controller.QueueCompose();
+		const bool reported = WaitFor([&] { return saturationNotices == 1; });
+		releaseDispatch = true;
+		return Check(firstRejected && repeatRejected, "A saturated command queue accepted excess work.") &&
+		       Check(reported && saturationNotices == 1,
+			       "Queue saturation did not produce one bounded player-facing rejection.");
+	}
+
+	bool TestRuntimeTeardownOwnsWorkerOrder()
+	{
+		std::atomic_int dispatches{ 0 };
+		{
+			CSXCaptureCompanion::CaptureRuntime runtime(
+				[&](json request) {
+					++dispatches;
+					if (request.at("action") == "sequence_start")
+						return json{ { "ok", true }, { "result", { { "requestId", "shutdown" } } } };
+					if (request.at("action") == "request_get") {
+						return json{ { "ok", true }, { "result", {
+							{ "requestId", "shutdown" }, { "state", "completed" },
+							{ "manifest", { { "finalPath", "D:/missing/shutdown/sequence.json" } } },
+						} } };
+					}
+					return json{ { "ok", false } };
+				},
+				[](std::string) {});
+			if (!runtime.Capture().QueueToggle(StartRequest()) ||
+				!WaitFor([&] { return runtime.Capture().CaptureState() == 3; }) ||
+				!runtime.Capture().QueueCompose() ||
+				!WaitFor([&] { return runtime.Composer().GetState() !=
+					CSXCaptureCompanion::ComposeState::kIdle; })) {
+				return Check(false, "The runtime teardown fixture did not queue composition.");
+			}
+		}
+		return Check(dispatches > 0,
+			"The runtime teardown fixture did not exercise the capture worker.");
 	}
 
 	bool TestScreenshotReceiptReportsCompletion(std::string a_terminal = "completed")
@@ -691,7 +760,8 @@ namespace
 
 int main()
 {
-	return TestCallerNeverWaitsForDispatch() && TestScreenshotReceiptReportsCompletion() &&
+	return TestCallerNeverWaitsForDispatch() && TestQueueSaturationIsReportedOnce() &&
+	       TestRuntimeTeardownOwnsWorkerOrder() && TestScreenshotReceiptReportsCompletion() &&
 	       TestScreenshotReceiptReportsCompletion("failed") &&
 	       TestStopReceiptIsPolledAndComposed() && TestToggleTerminalResolvesDeferredCompose() &&
 	       TestDeferredComposeDoesNotUseOlderManifest() &&

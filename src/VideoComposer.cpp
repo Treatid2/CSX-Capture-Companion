@@ -835,12 +835,6 @@ namespace CSXCaptureCompanion
 		}
 	}
 
-	VideoComposer& VideoComposer::GetSingleton()
-	{
-		static VideoComposer singleton;
-		return singleton;
-	}
-
 	bool VideoComposer::Queue(const std::filesystem::path& a_sequenceDirectory)
 	{
 		std::lock_guard workerLock(workerMutex);
@@ -911,23 +905,9 @@ namespace CSXCaptureCompanion
 			const bool anyOutputExists = std::ranges::any_of(encodings, [](const EncodingPlan& a_encoding) {
 				return std::filesystem::exists(a_encoding.output);
 			});
-			const bool allOutputsExist = std::ranges::all_of(encodings, [](const EncodingPlan& a_encoding) {
-				return std::filesystem::is_regular_file(a_encoding.output);
-			});
-			if (anyOutputExists) {
-				if (!allOutputsExist)
-					throw std::runtime_error("Only part of the deterministic video output set already exists.");
-				std::string message = "Already composed: ";
-				for (std::size_t index = 0; index < encodings.size(); ++index) {
-					if (index != 0)
-						message += ", ";
-					message += encodings[index].output.filename().string();
-				}
-				SetStatus(ComposeState::kComplete, message);
-				ShowNotification("Latest capture is already composed");
-				SKSE::log::info("{}", message);
-				return;
-			}
+			if (anyOutputExists)
+				throw std::runtime_error(
+					"A deterministic video output already exists; ownership cannot be verified, so it was preserved.");
 			std::vector<std::filesystem::path> completedOutputs;
 			for (const auto& encoding : encodings) {
 				if (std::filesystem::exists(encoding.temporary))

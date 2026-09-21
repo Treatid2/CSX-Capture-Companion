@@ -15,6 +15,9 @@ sets. Audio is outside the first version.
   for asynchronous MP4 composition once its terminal manifest is available.
 - MCM toggles install or remove those powers and reports capture/composer state.
 
+The native command queue is bounded. If rapid activations fill it, the first
+rejected power reports a HUD warning and log entry instead of disappearing.
+
 The 0.1.1 demonstrator asks CSX to expand its current settings for both stills
 and sequences. Screenshot eye/format and Frame Capture eye/format/cadence
 therefore have one owner: the CSX menu. The Start/Stop power requests CSX's
@@ -57,8 +60,10 @@ set. Both-eye sessions produce one half-SBS-compatible `-sbs.mp4`, with the left
 eye in the left half and the right eye in the right half. Each eye is scaled
 proportionally when necessary to keep the encoded canvas within 3840x2160; the
 lossless source frames are never changed. Existing outputs are preserved with a
-deterministic name; composing the same manifest again reports the existing
-video instead of encoding a numbered duplicate.
+deterministic name. Because version 1 does not write provenance that binds an
+MP4 to its manifest, encountering that name again fails closed instead of
+claiming an arbitrary file is complete, overwriting it, or adding a numbered
+duplicate.
 
 The composer also accepts the exact redundant three-output shape written by
 pre-release CSX builds (SBS plus matching Left and Right streams). It uses the
