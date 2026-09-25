@@ -32,12 +32,18 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 - Missing interior and trailing slots duplicate the preceding image. The final
   scheduled slot receives one complete sample interval, so recorded trailing
   drops remain visible without shortening playback.
-- A Left or Right session produces one `-left.mp4` or `-right.mp4` file. If that
-  name already exists, a numeric suffix preserves the earlier output.
-- A Both session produces one double-width `-sbs.mp4`. The left eye occupies the
-  left half and the right eye occupies the right half.
-- The first written frame establishes dimensions; a later size change fails the
-  composition instead of creating a malformed stream.
+- A Left or Right session produces one `-left.mp4` or `-right.mp4` file.
+- A Both session produces one half-SBS-compatible `-sbs.mp4`. The left eye
+  occupies the left half and the right eye occupies the right half.
+- Source eyes are scaled proportionally when required to keep the encoded canvas
+  within 3840x2160. The lossless input files are not modified.
+- The encoder selects quality-based variable bitrate at maximum quality and
+  maximum quality-over-speed. Large files are an intentional tradeoff for
+  retaining detail in high-resolution VR captures.
+- The first written frame establishes dimensions; a later source-size change
+  fails the composition instead of creating a malformed stream.
+- Playback timing follows the manifest. The composer holds missing scheduled
+  slots but cannot synthesize motion between sparsely captured frames.
 - `audio` remains false and no audio stream is created.
 
 ## Worker and ownership
@@ -45,9 +51,15 @@ available, the worker reports failure and leaves all lossless inputs untouched.
 `VideoComposer` owns one worker thread and serializes jobs. It decodes and
 encodes away from Papyrus, the SKSE message callback, and the render thread. A
 second request while queued or encoding is rejected as busy.
+An existing deterministic output is preserved but never treated as proof of a
+completed composition. Version 1 fails closed because it has no provenance
+record binding arbitrary existing MP4 bytes to the requested manifest. It does
+not overwrite the file or create a numbered duplicate.
 
-Version 1 owns and joins an active worker during process shutdown so no encoder
-or notification callback can outlive the plugin. Windows codec and filesystem
+The production runtime owns the composer before the capture controller and
+destroys the controller first. Its capture worker is therefore stopped and
+joined before the composer or its worker can be destroyed, so no queued capture
+callback can enter destroyed composer state. Windows codec and filesystem
 calls are synchronous and are not cooperatively cancellable, so bounded shutdown
 is not promised while composition is active. Finish or stop composition before
 quitting Skyrim when immediate process exit matters.
@@ -55,7 +67,13 @@ quitting Skyrim when immediate process exit matters.
 Before encoding, the worker validates every source, output, temporary path, and
 output suffix as one plan. It accepts at most two output streams, bounds the
 manifest and timeline sizes, and consumes only artifacts marked committed by
-CSX. Outputs are unique leaf names beside the frame-set directory and cannot
+CSX. Composition also requires the exact completed sequence request ID, the
+artifact's selected view/format/colour contract, and its committed byte count
+and SHA-256. It rejects legacy manifests, rooted or traversing paths, and any
+sequence or artifact path containing a reparse point. Each source file is held
+without write/delete sharing while its current size and digest are verified
+immediately before WIC decodes it. Outputs are unique leaf names beside the
+frame-set directory and cannot
 alias a source. Each job uses a new temporary name; an unrelated pre-existing
 temporary file is never removed. A temporary output is renamed with
 write-through semantics only after `IMFSinkWriter::Finalize` succeeds. The

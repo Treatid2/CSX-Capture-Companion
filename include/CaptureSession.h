@@ -6,13 +6,44 @@
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
+#include <string_view>
 
 namespace CSXCaptureCompanion
 {
 	using ScreenshotDispatch = std::function<nlohmann::json(nlohmann::json)>;
 
-	[[nodiscard]] bool IsSuccessfulResponse(const nlohmann::json& a_response) noexcept;
-	[[nodiscard]] std::string AcceptedRequestId(const nlohmann::json& a_response) noexcept;
+	enum class ReceiptFailure
+	{
+		kNone,
+		kTransient,
+		kPermanent,
+		kInvalid
+	};
+
+	struct CaptureUpdate
+	{
+		std::string requestId;
+		std::filesystem::path manifest;
+		std::int32_t state{ -1 };
+		ReceiptFailure failure{ ReceiptFailure::kNone };
+		bool accepted{ false };
+		bool terminal{ false };
+		bool hasManifest{ false };
+	};
+
+	struct CompletedCapture
+	{
+		std::filesystem::path manifest;
+		std::string requestId;
+	};
+
+	[[nodiscard]] bool
+	IsSuccessfulResponse(const nlohmann::json& a_response) noexcept;
+	[[nodiscard]] std::string
+	AcceptedRequestId(const nlohmann::json& a_response) noexcept;
+	/// Map documented receipt states to active (1), stopping (2), complete (3),
+	/// failed (4), or invalid (-1) for both still and sequence tracking.
+	[[nodiscard]] std::int32_t CaptureStateCode(std::string_view a_state) noexcept;
 
 	class CaptureSession final
 	{
@@ -21,17 +52,28 @@ namespace CSXCaptureCompanion
 
 		[[nodiscard]] std::int32_t Refresh();
 		[[nodiscard]] bool Toggle(nlohmann::json a_startRequest);
+		[[nodiscard]] CaptureUpdate RefreshUpdate();
+		[[nodiscard]] CaptureUpdate ToggleUpdate(nlohmann::json a_startRequest);
+		[[nodiscard]] std::string AbandonActiveRequest();
+		void MarkUnavailable();
+		[[nodiscard]] std::int32_t CachedState() const;
+		/// Return the eligible terminal manifest of the latest accepted attempt.
 		[[nodiscard]] std::filesystem::path LatestManifest() const;
+		/// Return the request identity bound to the eligible terminal manifest.
+		[[nodiscard]] std::string LatestManifestRequestId() const;
+		/// Return the terminal manifest and request identity from one state snapshot.
+		[[nodiscard]] CompletedCapture LatestCompletedCapture() const;
 		[[nodiscard]] std::string ActiveRequestId() const;
 
 	private:
-		std::int32_t RefreshLocked();
+		CaptureUpdate RefreshLocked();
 
 		ScreenshotDispatch dispatch;
 		mutable std::mutex operationMutex;
 		mutable std::mutex stateMutex;
 		std::string activeRequestId;
 		std::filesystem::path latestManifest;
+		std::string latestManifestRequestId;
 		std::int32_t lastState{ 0 };
 	};
 }

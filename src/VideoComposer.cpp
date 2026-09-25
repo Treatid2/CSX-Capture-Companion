@@ -1,6 +1,8 @@
 #include "VideoComposer.h"
 
 #include <Windows.h>
+#include <bcrypt.h>
+#include <codecapi.h>
 #include <combaseapi.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -11,11 +13,13 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cwctype>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -49,6 +53,8 @@ namespace CSXCaptureCompanion
 		{
 			std::uint64_t timestampUs{};
 			std::filesystem::path path;
+			std::uint64_t expectedBytes{};
+			std::string expectedSha256;
 		};
 
 		struct StreamPlan
@@ -76,8 +82,15 @@ namespace CSXCaptureCompanion
 		};
 
 		constexpr std::uintmax_t kMaximumManifestBytes = 16 * 1024 * 1024;
-		constexpr std::size_t kMaximumStreams = 2;
+		constexpr std::size_t kMaximumManifestOutputs = 4;
 		constexpr std::size_t kMaximumSourceFrames = 60'000;
+		constexpr std::uint32_t kMaximumVideoWidth = 3840;
+		constexpr std::uint32_t kMaximumVideoHeight = 2160;
+		constexpr std::uint64_t kMinimumVideoBitrate = 50'000'000;
+		constexpr std::uint64_t kMaximumVideoBitrate = 200'000'000;
+		constexpr std::uint64_t kVideoBitsPerPixel = 2;
+		constexpr std::uint32_t kVideoQuality = 100;
+		constexpr std::uint32_t kVideoQualityVsSpeed = 100;
 		std::atomic_uint64_t g_temporarySequence{ 1 };
 
 		class ComRuntime final
@@ -146,6 +159,91 @@ namespace CSXCaptureCompanion
 			}
 		}
 
+		class FileHandle final
+		{
+		public:
+			explicit FileHandle(HANDLE a_handle) : handle(a_handle) {}
+			~FileHandle()
+			{
+				if (handle != INVALID_HANDLE_VALUE)
+					CloseHandle(handle);
+			}
+			FileHandle(const FileHandle&) = delete;
+			FileHandle& operator=(const FileHandle&) = delete;
+			[[nodiscard]] HANDLE Get() const noexcept { return handle; }
+
+		private:
+			HANDLE handle{ INVALID_HANDLE_VALUE };
+		};
+
+		class AlgorithmHandle final
+		{
+		public:
+			~AlgorithmHandle()
+			{
+				if (handle)
+					BCryptCloseAlgorithmProvider(handle, 0);
+			}
+			BCRYPT_ALG_HANDLE* Address() noexcept { return &handle; }
+			[[nodiscard]] BCRYPT_ALG_HANDLE Get() const noexcept { return handle; }
+
+		private:
+			BCRYPT_ALG_HANDLE handle{};
+		};
+
+		class HashHandle final
+		{
+		public:
+			~HashHandle()
+			{
+				if (handle)
+					BCryptDestroyHash(handle);
+			}
+			BCRYPT_HASH_HANDLE* Address() noexcept { return &handle; }
+			[[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return handle; }
+
+		private:
+			BCRYPT_HASH_HANDLE handle{};
+		};
+
+		void CheckNtStatus(NTSTATUS a_status, std::string_view a_operation)
+		{
+			if (a_status < 0)
+				throw std::runtime_error(std::string(a_operation) + " failed.");
+		}
+
+		std::string HashFileHandle(HANDLE a_file)
+		{
+			AlgorithmHandle algorithm;
+			CheckNtStatus(BCryptOpenAlgorithmProvider(
+				algorithm.Address(), BCRYPT_SHA256_ALGORITHM, nullptr, 0),
+				"BCryptOpenAlgorithmProvider");
+			HashHandle hash;
+			CheckNtStatus(BCryptCreateHash(
+				algorithm.Get(), hash.Address(), nullptr, 0, nullptr, 0, 0),
+				"BCryptCreateHash");
+			std::vector<std::uint8_t> buffer(1024 * 1024);
+			for (;;) {
+				DWORD bytesRead = 0;
+				if (!ReadFile(a_file, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr))
+					throw std::runtime_error("A capture artifact could not be read for verification.");
+				if (bytesRead == 0)
+					break;
+				CheckNtStatus(BCryptHashData(hash.Get(), buffer.data(), bytesRead, 0), "BCryptHashData");
+			}
+			std::array<std::uint8_t, 32> digest{};
+			CheckNtStatus(BCryptFinishHash(hash.Get(), digest.data(), static_cast<ULONG>(digest.size()), 0),
+				"BCryptFinishHash");
+			static constexpr char digits[] = "0123456789abcdef";
+			std::string result;
+			result.reserve(digest.size() * 2);
+			for (const auto byte : digest) {
+				result.push_back(digits[byte >> 4]);
+				result.push_back(digits[byte & 0x0F]);
+			}
+			return result;
+		}
+
 		std::wstring Utf8ToWide(const std::string& a_value)
 		{
 			if (a_value.empty()) {
@@ -178,6 +276,24 @@ namespace CSXCaptureCompanion
 			return result;
 		}
 
+		bool IsHexDigest(std::string_view a_value)
+		{
+			return a_value.size() == 64 && std::ranges::all_of(a_value, [](unsigned char a_character) {
+				return std::isxdigit(a_character) != 0;
+			});
+		}
+
+		void RejectReparsePoints(const std::filesystem::path& a_path)
+		{
+			std::filesystem::path current;
+			for (const auto& component : a_path) {
+				current /= component;
+				const auto attributes = GetFileAttributesW(current.c_str());
+				if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+					throw std::runtime_error("Capture assets may not traverse reparse points.");
+			}
+		}
+
 		std::filesystem::path ManifestAssetPath(
 			const std::filesystem::path& a_sequenceDirectory,
 			const json& a_artifact)
@@ -190,8 +306,28 @@ namespace CSXCaptureCompanion
 				throw std::runtime_error("A completed frame references an uncommitted artifact.");
 			}
 			const auto wide = Utf8ToWide(a_artifact["path"].get<std::string>());
-			const std::filesystem::path path(wide);
-			return path.is_absolute() ? path : a_sequenceDirectory / path;
+			const std::filesystem::path declared(wide);
+			if (declared.empty() || declared.is_absolute() || declared.has_root_name() || declared.has_root_directory())
+				throw std::runtime_error("Capture artifact paths must be relative to the sequence directory.");
+			for (const auto& component : declared) {
+				if (component == L"." || component == L"..")
+					throw std::runtime_error("Capture artifact paths may not contain traversal components.");
+			}
+
+			std::error_code error;
+			const auto root = std::filesystem::weakly_canonical(a_sequenceDirectory, error);
+			if (error)
+				throw std::runtime_error("The sequence directory could not be canonicalized.");
+			RejectReparsePoints(root);
+			const auto lexicalCandidate = root / declared;
+			RejectReparsePoints(lexicalCandidate);
+			const auto candidate = std::filesystem::weakly_canonical(lexicalCandidate, error);
+			if (error)
+				throw std::runtime_error("A capture artifact path could not be canonicalized.");
+			const auto relative = candidate.lexically_relative(root);
+			if (relative.empty() || relative.is_absolute() || *relative.begin() == L"..")
+				throw std::runtime_error("A capture artifact escaped the sequence directory.");
+			return candidate;
 		}
 
 		std::uint64_t ReadTimestamp(const json& a_object, std::string_view a_name)
@@ -341,12 +477,17 @@ namespace CSXCaptureCompanion
 			return !error && equivalent;
 		}
 
-		std::vector<StreamPlan> ReadManifest(const std::filesystem::path& a_manifestOrDirectory)
+		std::vector<StreamPlan> ReadManifest(
+			const std::filesystem::path& a_manifestOrDirectory,
+			std::string_view a_expectedRequestId)
 		{
+			if (a_expectedRequestId.empty())
+				throw std::runtime_error("Video composition requires the completed sequence request identity.");
 			const auto manifestPath = std::filesystem::is_directory(a_manifestOrDirectory) ?
 			                          a_manifestOrDirectory / "sequence.json" :
 			                          a_manifestOrDirectory;
 			const auto sequenceDirectory = manifestPath.parent_path();
+			RejectReparsePoints(std::filesystem::absolute(manifestPath));
 			std::error_code manifestError;
 			const auto manifestBytes = std::filesystem::file_size(manifestPath, manifestError);
 			if (manifestError || manifestBytes > kMaximumManifestBytes)
@@ -359,56 +500,45 @@ namespace CSXCaptureCompanion
 			stream >> manifest;
 			std::vector<StreamPlan> plans;
 			if (manifest.value("schema", "") == "csx.frame-sequence/1") {
-				if (manifest.value("state", "") != "complete")
-					throw std::runtime_error("The legacy manifest is not complete.");
-				const auto eye = manifest.value("eye", "Left");
-				if (eye == "Both") {
-					plans.push_back({ "left_eye", "left", {}, {} });
-					plans.push_back({ "right_eye", "right", {}, {} });
-				} else if (eye == "Right") {
-					plans.push_back({ "right_eye", "right", {}, {} });
-				} else {
-					plans.push_back({ "left_eye", "left", {}, {} });
-				}
-				const auto& frames = manifest.at("frames");
-				if (!frames.is_array() || frames.size() > kMaximumSourceFrames)
-					throw std::runtime_error("The legacy manifest contains too many frame records.");
-				for (const auto& entry : frames) {
-					const auto timestamp = ReadTimestamp(entry, "timestampUs");
-					for (auto& plan : plans)
-						plan.scheduledTimestampsUs.push_back(timestamp);
-					if (!entry.value("written", false))
-						continue;
-					const auto& paths = entry.at("paths");
-					if (!paths.is_array() || paths.size() != plans.size())
-						throw std::runtime_error("A written frame has the wrong number of eye paths.");
-					for (std::size_t index = 0; index < plans.size(); ++index) {
-						const auto path = sequenceDirectory / std::filesystem::path(Utf8ToWide(paths.at(index).get<std::string>()));
-						if (!std::filesystem::is_regular_file(path))
-							throw std::runtime_error("A lossless source frame is missing.");
-						plans[index].frames.push_back({ timestamp, path });
-					}
-				}
+				throw std::runtime_error(
+					"Legacy sequence manifests lack request and artifact integrity custody and cannot be composed.");
 			} else {
 				const auto contract = manifest.value("contract", json::object());
 				if (contract.value("name", "") != "csx.screenshot" || contract.value("major", 0) != 1 ||
 					manifest.value("state", "") != "final")
 					throw std::runtime_error("The manifest is not a final Screenshot API v1 sequence.");
-				const auto outputs = manifest.at("capture").at("outputs");
+				if (!manifest.contains("requestId") || !manifest["requestId"].is_string() ||
+					manifest["requestId"].get<std::string>() != a_expectedRequestId) {
+					throw std::runtime_error("The final manifest does not belong to the requested capture sequence.");
+				}
+				const auto outputs = manifest.at("effective").at("outputs");
 				if (!outputs.is_array() || outputs.empty())
 					throw std::runtime_error("The Screenshot API manifest has no outputs.");
-				if (outputs.size() > kMaximumStreams)
+				if (outputs.size() > kMaximumManifestOutputs)
 					throw std::runtime_error("The Screenshot API manifest has too many outputs.");
 				std::set<std::string, std::less<>> suffixes;
 				std::set<std::string, std::less<>> views;
-				for (const auto& output : outputs) {
+				std::vector<std::size_t> selectedOutputIndices;
+				std::optional<std::size_t> leftOutput;
+				std::optional<std::size_t> rightOutput;
+				std::optional<std::size_t> sideBySideOutput;
+				std::vector<std::string> outputFormats;
+				std::vector<std::string> outputColourContracts;
+				for (std::size_t outputIndex = 0; outputIndex < outputs.size(); ++outputIndex) {
+					const auto& output = outputs.at(outputIndex);
 					if (!output.is_object())
 						throw std::runtime_error("A Screenshot API output entry is invalid.");
 					if (!output.contains("view") || !output["view"].is_string())
 						throw std::runtime_error("A Screenshot API output has no usable view.");
 					const auto view = output["view"].get<std::string>();
-					if ((view != "left_eye" && view != "right_eye") || !views.insert(view).second)
-						throw std::runtime_error("Video composition requires unique left- or right-eye outputs.");
+					static constexpr std::array supportedViews = {
+						"source_native", "left_eye", "right_eye", "side_by_side",
+						"framed_left", "framed_right", "framed_combined"
+					};
+					if (std::ranges::find(supportedViews, view) == supportedViews.end() ||
+						!views.insert(view).second) {
+						throw std::runtime_error("Video composition requires unique supported output views.");
+					}
 					std::string suffix;
 					if (output.contains("nameSuffix")) {
 						if (!output["nameSuffix"].is_string())
@@ -427,7 +557,44 @@ namespace CSXCaptureCompanion
 					});
 					if (!suffixes.insert(comparable).second)
 						throw std::runtime_error("Output suffixes must be unique.");
-					plans.push_back({ view, std::move(suffix), {}, {} });
+					if (!output.contains("encoding") || !output["encoding"].is_object() ||
+						!output["encoding"].contains("format") || !output["encoding"]["format"].is_string() ||
+						!output["encoding"].contains("colourContract") ||
+						!output["encoding"]["colourContract"].is_string()) {
+						throw std::runtime_error("A Screenshot API output has no complete encoding contract.");
+					}
+					outputFormats.push_back(output["encoding"]["format"].get<std::string>());
+					outputColourContracts.push_back(
+						output["encoding"]["colourContract"].get<std::string>());
+					if (view == "left_eye")
+						leftOutput = outputIndex;
+					else if (view == "right_eye")
+						rightOutput = outputIndex;
+					else if (view == "side_by_side")
+						sideBySideOutput = outputIndex;
+				}
+
+				if (leftOutput && rightOutput) {
+					const bool exactStereo = outputs.size() == 2;
+					const bool legacyRedundantStereo = outputs.size() == 3 && sideBySideOutput.has_value();
+					if (!exactStereo && !legacyRedundantStereo) {
+						throw std::runtime_error("The Screenshot API manifest has ambiguous stereo outputs.");
+					}
+					selectedOutputIndices = { *leftOutput, *rightOutput };
+				} else if (outputs.size() == 1) {
+					selectedOutputIndices = { 0 };
+				} else {
+					throw std::runtime_error("Video composition requires one output or a synchronized stereo pair.");
+				}
+
+				for (const auto outputIndex : selectedOutputIndices) {
+					const auto& output = outputs.at(outputIndex);
+					plans.push_back({
+						output.at("view").get<std::string>(),
+						output.value("nameSuffix", output.at("view").get<std::string>()),
+						{},
+						{},
+					});
 				}
 				const auto& children = manifest.at("children");
 				if (!children.is_array() || children.size() > kMaximumSourceFrames)
@@ -445,13 +612,33 @@ namespace CSXCaptureCompanion
 					if (!written)
 						continue;
 					const auto& artifacts = child.at("artifacts");
-					if (!artifacts.is_array() || artifacts.size() != plans.size())
+					if (!artifacts.is_array() || artifacts.size() != outputs.size())
 						throw std::runtime_error("A completed frame has the wrong number of output artifacts.");
 					for (std::size_t index = 0; index < plans.size(); ++index) {
-						const auto path = ManifestAssetPath(sequenceDirectory, artifacts.at(index));
+						const auto outputIndex = selectedOutputIndices.at(index);
+						const auto& artifact = artifacts.at(outputIndex);
+						if (!artifact.is_object() || !artifact.contains("actual") || !artifact["actual"].is_object())
+							throw std::runtime_error("A completed artifact has no actual output identity.");
+						const auto& actual = artifact["actual"];
+						if (actual.value("view", "") != plans[index].view ||
+							actual.value("format", "") != outputFormats.at(outputIndex) ||
+							actual.value("colourContract", "") != outputColourContracts.at(outputIndex)) {
+							throw std::runtime_error("A completed artifact does not match its selected output contract.");
+						}
+						if (!artifact.contains("bytes") || !artifact["bytes"].is_number_unsigned() ||
+							!artifact.contains("sha256") || !artifact["sha256"].is_string() ||
+							!IsHexDigest(artifact["sha256"].get<std::string>())) {
+							throw std::runtime_error("A completed artifact has no valid size and SHA-256 custody.");
+						}
+						const auto path = ManifestAssetPath(sequenceDirectory, artifact);
 						if (!std::filesystem::is_regular_file(path))
 							throw std::runtime_error("A lossless source frame is missing.");
-						plans[index].frames.push_back({ timestamp, path });
+						auto digest = artifact["sha256"].get<std::string>();
+						std::ranges::transform(digest, digest.begin(), [](unsigned char a_character) {
+							return static_cast<char>(std::tolower(a_character));
+						});
+						plans[index].frames.push_back(
+							{ timestamp, path, artifact["bytes"].get<std::uint64_t>(), std::move(digest) });
 					}
 				}
 			}
@@ -504,24 +691,11 @@ namespace CSXCaptureCompanion
 			const auto sequenceName = a_sequenceDirectory.filename().wstring();
 			std::vector<EncodingPlan> result;
 			std::set<std::wstring> reserved;
-			std::uint32_t outputOrdinal = 1;
-			for (; outputOrdinal <= 10'000; ++outputOrdinal) {
-				const auto available = std::ranges::all_of(sources, [&](const OutputSource& a_source) {
-					const auto baseName = sequenceName + L"-" + Utf8ToWide(a_source.suffix);
-					const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
-					return !std::filesystem::exists(outputDirectory / (baseName + ordinal + L".mp4"));
-				});
-				if (available)
-					break;
-			}
-			if (outputOrdinal > 10'000)
-				throw std::runtime_error("No available video output name could be found.");
 
 			for (const auto& source : sources) {
 				const auto suffix = Utf8ToWide(source.suffix);
 				const auto baseName = sequenceName + L"-" + suffix;
-				const auto ordinal = outputOrdinal == 1 ? std::wstring{} : L"-" + std::to_wstring(outputOrdinal);
-				auto output = outputDirectory / (baseName + ordinal + L".mp4");
+				auto output = outputDirectory / (baseName + L".mp4");
 
 				std::filesystem::path temporary;
 				for (std::uint32_t attempt = 0; attempt < 32; ++attempt) {
@@ -557,17 +731,57 @@ namespace CSXCaptureCompanion
 
 		struct DecodedFrame
 		{
+			std::uint32_t sourceWidth{};
+			std::uint32_t sourceHeight{};
 			std::uint32_t width{};
 			std::uint32_t height{};
 			std::uint32_t stride{};
 			std::vector<std::uint8_t> pixels;
 		};
 
-		DecodedFrame DecodeFrameAsset(IWICImagingFactory* a_factory, const std::filesystem::path& a_path)
+		DecodedFrame DecodeFrameAsset(
+			IWICImagingFactory* a_factory,
+			const Frame& a_source,
+			std::uint32_t a_maximumWidth,
+			std::uint32_t a_maximumHeight)
 		{
+			RejectReparsePoints(a_source.path);
+			const FileHandle custody(CreateFileW(
+				a_source.path.c_str(),
+				GENERIC_READ,
+				FILE_SHARE_READ,
+				nullptr,
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+				nullptr));
+			if (custody.Get() == INVALID_HANDLE_VALUE)
+				throw std::runtime_error("A capture artifact could not be opened under exclusive custody.");
+			const auto finalPathLength = GetFinalPathNameByHandleW(
+				custody.Get(), nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (finalPathLength == 0)
+				throw std::runtime_error("A capture artifact's opened path could not be verified.");
+			std::wstring finalPathValue(finalPathLength, L'\0');
+			const auto written = GetFinalPathNameByHandleW(
+				custody.Get(), finalPathValue.data(), finalPathLength,
+				FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (written == 0 || written >= finalPathLength)
+				throw std::runtime_error("A capture artifact's opened path could not be verified.");
+			finalPathValue.resize(written);
+			if (finalPathValue.starts_with(L"\\\\?\\"))
+				finalPathValue.erase(0, 4);
+			if (ComparablePath(finalPathValue) != ComparablePath(a_source.path))
+				throw std::runtime_error("A capture artifact resolved outside its verified path.");
+			LARGE_INTEGER size{};
+			if (!GetFileSizeEx(custody.Get(), &size) || size.QuadPart < 0 ||
+				static_cast<std::uint64_t>(size.QuadPart) != a_source.expectedBytes) {
+				throw std::runtime_error("A capture artifact no longer matches its committed size.");
+			}
+			if (HashFileHandle(custody.Get()) != a_source.expectedSha256)
+				throw std::runtime_error("A capture artifact no longer matches its committed SHA-256.");
+
 			ComPtr<IWICBitmapDecoder> decoder;
 			Check(a_factory->CreateDecoderFromFilename(
-				a_path.c_str(),
+				a_source.path.c_str(),
 				nullptr,
 				GENERIC_READ,
 				WICDecodeMetadataCacheOnLoad,
@@ -588,10 +802,38 @@ namespace CSXCaptureCompanion
 				"IWICFormatConverter::Initialize");
 
 			DecodedFrame decoded;
-			Check(converter->GetSize(&decoded.width, &decoded.height), "IWICBitmapSource::GetSize");
-			if (decoded.width == 0 || decoded.height == 0 ||
-				decoded.width > std::numeric_limits<std::uint32_t>::max() / 4) {
+			Check(converter->GetSize(&decoded.sourceWidth, &decoded.sourceHeight), "IWICBitmapSource::GetSize");
+			if (decoded.sourceWidth < 2 || decoded.sourceHeight < 2) {
 				throw std::runtime_error("A source frame has invalid dimensions.");
+			}
+			decoded.width = decoded.sourceWidth;
+			decoded.height = decoded.sourceHeight;
+			if (decoded.width > a_maximumWidth) {
+				decoded.height = static_cast<std::uint32_t>(
+					(static_cast<std::uint64_t>(decoded.height) * a_maximumWidth) / decoded.width);
+				decoded.width = a_maximumWidth;
+			}
+			if (decoded.height > a_maximumHeight) {
+				decoded.width = static_cast<std::uint32_t>(
+					(static_cast<std::uint64_t>(decoded.width) * a_maximumHeight) / decoded.height);
+				decoded.height = a_maximumHeight;
+			}
+			decoded.width &= ~std::uint32_t{ 1 };
+			decoded.height &= ~std::uint32_t{ 1 };
+			if (decoded.width < 2 || decoded.height < 2 ||
+				decoded.width > std::numeric_limits<std::uint32_t>::max() / 4) {
+				throw std::runtime_error("A source frame cannot be scaled to a valid video frame.");
+			}
+
+			ComPtr<IWICBitmapSource> bitmapSource;
+			Check(converter.As(&bitmapSource), "IWICFormatConverter::QueryInterface");
+			ComPtr<IWICBitmapScaler> scaler;
+			if (decoded.width != decoded.sourceWidth || decoded.height != decoded.sourceHeight) {
+				Check(a_factory->CreateBitmapScaler(scaler.GetAddressOf()), "IWICImagingFactory::CreateBitmapScaler");
+				Check(scaler->Initialize(
+					converter.Get(), decoded.width, decoded.height, WICBitmapInterpolationModeFant),
+					"IWICBitmapScaler::Initialize");
+				Check(scaler.As(&bitmapSource), "IWICBitmapScaler::QueryInterface");
 			}
 			decoded.stride = decoded.width * 4;
 			const auto bytes = static_cast<std::uint64_t>(decoded.stride) * decoded.height;
@@ -601,7 +843,7 @@ namespace CSXCaptureCompanion
 			decoded.pixels.resize(static_cast<std::size_t>(bytes));
 			// WIC returns top-down scan lines. MF_MT_DEFAULT_STRIDE is positive
 			// for top-down images, so pass those rows through unchanged.
-			Check(converter->CopyPixels(
+			Check(bitmapSource->CopyPixels(
 				nullptr,
 				decoded.stride,
 				static_cast<std::uint32_t>(bytes),
@@ -615,12 +857,15 @@ namespace CSXCaptureCompanion
 			const EncodingPlan& a_plan,
 			std::size_t a_index)
 		{
-			auto primary = DecodeFrameAsset(a_factory, a_plan.primary->frames.at(a_index).path);
+			const auto eyeMaximumWidth = a_plan.secondary ? kMaximumVideoWidth / 2 : kMaximumVideoWidth;
+			auto primary = DecodeFrameAsset(
+				a_factory, a_plan.primary->frames.at(a_index), eyeMaximumWidth, kMaximumVideoHeight);
 			if (!a_plan.secondary)
 				return primary;
 
-			auto secondary = DecodeFrameAsset(a_factory, a_plan.secondary->frames.at(a_index).path);
-			if (primary.width != secondary.width || primary.height != secondary.height)
+			auto secondary = DecodeFrameAsset(
+				a_factory, a_plan.secondary->frames.at(a_index), eyeMaximumWidth, kMaximumVideoHeight);
+			if (primary.sourceWidth != secondary.sourceWidth || primary.sourceHeight != secondary.sourceHeight)
 				throw std::runtime_error("Stereo source eyes have different dimensions.");
 			if (primary.width > std::numeric_limits<std::uint32_t>::max() - secondary.width)
 				throw std::runtime_error("The side-by-side video width is too large.");
@@ -676,7 +921,10 @@ namespace CSXCaptureCompanion
 			const auto frameRate = a_plan.timeline.frameRate;
 			const auto pixelsPerSecond =
 				static_cast<std::uint64_t>(first.width) * first.height * frameRate;
-			const auto bitrate64 = std::clamp<std::uint64_t>(pixelsPerSecond / 8, 4'000'000, 50'000'000);
+			const auto bitrate64 = std::clamp(
+				pixelsPerSecond * kVideoBitsPerPixel,
+				kMinimumVideoBitrate,
+				kMaximumVideoBitrate);
 			const auto bitrate = static_cast<std::uint32_t>(bitrate64);
 
 			ComPtr<IMFAttributes> attributes;
@@ -714,7 +962,21 @@ namespace CSXCaptureCompanion
 			Check(MFSetAttributeSize(inputType.Get(), MF_MT_FRAME_SIZE, first.width, first.height), "Set input frame size");
 			Check(MFSetAttributeRatio(inputType.Get(), MF_MT_FRAME_RATE, frameRate, 1), "Set input frame rate");
 			Check(MFSetAttributeRatio(inputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1), "Set input pixel aspect ratio");
-			Check(writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr), "IMFSinkWriter::SetInputMediaType");
+
+			ComPtr<IMFAttributes> encodingParameters;
+			Check(MFCreateAttributes(encodingParameters.GetAddressOf(), 3), "MFCreateAttributes(encoder)");
+			Check(encodingParameters->SetUINT32(
+				CODECAPI_AVEncCommonRateControlMode,
+				eAVEncCommonRateControlMode_Quality),
+				"Set quality rate-control mode");
+			Check(encodingParameters->SetUINT32(
+				CODECAPI_AVEncCommonQuality, kVideoQuality),
+				"Set video quality");
+			Check(encodingParameters->SetUINT32(
+				CODECAPI_AVEncCommonQualityVsSpeed, kVideoQualityVsSpeed),
+				"Set quality-versus-speed");
+			Check(writer->SetInputMediaType(streamIndex, inputType.Get(), encodingParameters.Get()),
+				"IMFSinkWriter::SetInputMediaType");
 			Check(writer->BeginWriting(), "IMFSinkWriter::BeginWriting");
 
 			const auto sampleDuration = static_cast<LONGLONG>(10'000'000 / frameRate);
@@ -744,13 +1006,9 @@ namespace CSXCaptureCompanion
 		}
 	}
 
-	VideoComposer& VideoComposer::GetSingleton()
-	{
-		static VideoComposer singleton;
-		return singleton;
-	}
-
-	bool VideoComposer::Queue(const std::filesystem::path& a_sequenceDirectory)
+	bool VideoComposer::Queue(
+		const std::filesystem::path& a_sequenceDirectory,
+		std::string a_expectedRequestId)
 	{
 		std::lock_guard workerLock(workerMutex);
 		if (workerActive) {
@@ -761,9 +1019,12 @@ namespace CSXCaptureCompanion
 		try {
 			SetStatus(ComposeState::kQueued, "Video composition queued.");
 			ShowNotification("Video composition queued");
-			worker = std::jthread([this, sequenceDirectory = a_sequenceDirectory] {
+			worker = std::jthread([
+				this,
+				sequenceDirectory = a_sequenceDirectory,
+				expectedRequestId = std::move(a_expectedRequestId)] {
 				try {
-					Run(sequenceDirectory);
+					Run(sequenceDirectory, expectedRequestId);
 				} catch (const std::exception& exception) {
 					SetStatus(ComposeState::kFailed, std::string("Video worker failed unexpectedly: ") + exception.what());
 					SKSE::log::error("{}", GetStatusText());
@@ -799,7 +1060,9 @@ namespace CSXCaptureCompanion
 		return statusText;
 	}
 
-	void VideoComposer::Run(std::filesystem::path a_sequenceDirectory)
+	void VideoComposer::Run(
+		std::filesystem::path a_sequenceDirectory,
+		std::string a_expectedRequestId)
 	{
 		try {
 			if (!std::filesystem::is_directory(a_sequenceDirectory))
@@ -815,8 +1078,14 @@ namespace CSXCaptureCompanion
 				IID_PPV_ARGS(factory.GetAddressOf())),
 				"CoCreateInstance(WICImagingFactory)");
 
-			const auto plans = ReadManifest(a_sequenceDirectory);
+			const auto plans = ReadManifest(a_sequenceDirectory, a_expectedRequestId);
 			const auto encodings = BuildEncodingPlans(a_sequenceDirectory, plans);
+			const bool anyOutputExists = std::ranges::any_of(encodings, [](const EncodingPlan& a_encoding) {
+				return std::filesystem::exists(a_encoding.output);
+			});
+			if (anyOutputExists)
+				throw std::runtime_error(
+					"A deterministic video output already exists; ownership cannot be verified, so it was preserved.");
 			std::vector<std::filesystem::path> completedOutputs;
 			for (const auto& encoding : encodings) {
 				if (std::filesystem::exists(encoding.temporary))

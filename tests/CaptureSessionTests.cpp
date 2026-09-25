@@ -85,8 +85,8 @@ namespace
 		       Check(session.Toggle(StartRequest()), "Could not establish the unusable-stop fixture state.") &&
 		       Check(!session.Toggle(StartRequest()), "An empty stop state was reported as successful.") &&
 		       Check(session.ActiveRequestId() == "A", "An empty stop state changed active request ownership.") &&
-		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/seed/sequence.json"),
-			       "An empty stop state replaced the latest valid manifest.") &&
+		       Check(session.LatestManifest().empty(),
+			       "A newer accepted capture retained implicit seed composition eligibility.") &&
 		       Check(session.Refresh() == 1, "An empty stop state replaced the last valid capture state.");
 	}
 
@@ -200,8 +200,64 @@ namespace
 
 		return Check(starts == 2, "The terminal receipt did not permit one successor start.") &&
 		       Check(session.ActiveRequestId() == "B", "The earlier receipt cleared the successor request.") &&
+		       Check(session.LatestManifest().empty(),
+			       "The successor retained historical automatic composition eligibility.");
+	}
+
+	bool TestToggleDoesNotRestartTerminalCapture()
+	{
+		std::atomic_int starts{ 0 };
+		CaptureSession session([&](json request) {
+			const auto action = request.at("action").get<std::string>();
+			if (action == "sequence_start") {
+				++starts;
+				return json{ { "ok", true }, { "result", { { "requestId", "A" } } } };
+			}
+			if (action == "request_get") {
+				return json{
+					{ "ok", true },
+					{ "result", {
+						{ "requestId", "A" },
+						{ "state", "stopped" },
+						{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
+					} },
+				};
+			}
+			return json{ { "ok", false } };
+		});
+
+		return Check(session.Toggle(StartRequest()), "Could not establish the capture request.") &&
+		       Check(session.Toggle(StartRequest()), "A terminal capture was not acknowledged by the toggle.") &&
+		       Check(starts == 1, "A stop toggle restarted a capture that had just become terminal.") &&
+		       Check(session.ActiveRequestId().empty(), "A terminal capture remained active after acknowledgement.") &&
 		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
-			       "The completed manifest was not retained.");
+			       "The acknowledged terminal capture did not retain its manifest.") &&
+		       Check(session.LatestManifestRequestId() == "A",
+			       "The acknowledged terminal capture did not retain its request identity.");
+	}
+
+	bool TestPermanentRefreshClassification()
+	{
+		CaptureSession session([](json request) {
+			if (request.at("action") == "sequence_start")
+				return json{ { "ok", true }, { "result", { { "requestId", "missing" } } } };
+			return json{
+				{ "ok", false },
+				{ "error", { { "code", "request_not_found" }, { "retryable", false } } },
+			};
+		});
+
+		if (!Check(session.Toggle(StartRequest()),
+				"Could not establish the missing-request fixture."))
+			return false;
+		const auto update = session.RefreshUpdate();
+		return Check(update.requestId == "missing",
+				   "The failed refresh lost request custody.") &&
+		       Check(update.failure ==
+						 CSXCaptureCompanion::ReceiptFailure::kPermanent,
+				   "request_not_found was not classified as permanent.") &&
+		       Check(session.ActiveRequestId() == "missing",
+				   "A failed refresh silently cleared custody.");
 	}
 }
 
@@ -209,6 +265,7 @@ int main()
 {
 	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
 	                    TestUnusableStopReceipt() && TestConcurrentToggle() &&
-	                    TestRefreshThenSuccessorStart();
+	                    TestRefreshThenSuccessorStart() && TestToggleDoesNotRestartTerminalCapture() &&
+	                    TestPermanentRefreshClassification();
 	return passed ? 0 : 1;
 }

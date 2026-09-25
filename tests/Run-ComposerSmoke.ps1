@@ -27,8 +27,10 @@ function Write-TestManifest {
 		[Parameter(Mandatory)] [string[]] $Suffixes,
 		[Parameter(Mandatory)] [object[]] $Timestamps,
 		[Parameter(Mandatory)] [string[]] $ArtifactPaths,
+		[string[]] $Views = @(),
 		[string[]] $States = @(),
-		[bool] $Committed = $true
+		[bool] $Committed = $true,
+		[string] $RequestId = 'fixture-sequence'
 	)
 	if ($Suffixes.Count -ne $ArtifactPaths.Count) {
 		throw 'Each test output must have one artifact path.'
@@ -36,14 +38,43 @@ function Write-TestManifest {
 	if ($States.Count -ne 0 -and $States.Count -ne $Timestamps.Count) {
 		throw 'Each explicitly stated test child must have one timestamp.'
 	}
+	if ($Views.Count -ne 0 -and $Views.Count -ne $Suffixes.Count) {
+		throw 'Each explicitly stated test output must have one view.'
+	}
 	New-Item -ItemType Directory -Force -Path $Sequence | Out-Null
+	$assetDirectory = Join-Path $Sequence 'assets'
+	New-Item -ItemType Directory -Force -Path $assetDirectory | Out-Null
+	$assets = @()
+	for ($index = 0; $index -lt $ArtifactPaths.Count; $index++) {
+		$source = Get-Item -LiteralPath $ArtifactPaths[$index]
+		$format = $source.Extension.TrimStart('.').ToLowerInvariant()
+		$destination = Join-Path $assetDirectory ("output-$index.$format")
+		if ($source.FullName -ne [System.IO.Path]::GetFullPath($destination)) {
+			Copy-Item -LiteralPath $source.FullName -Destination $destination -Force
+		}
+		$asset = Get-Item -LiteralPath $destination
+		$assets += [ordered]@{
+			path = "assets/$($asset.Name)"
+			committed = $Committed
+			bytes = [uint64]$asset.Length
+			sha256 = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+			format = $format
+		}
+	}
 	$children = @()
 	for ($index = 0; $index -lt $Timestamps.Count; $index++) {
 		$state = if ($States.Count -eq 0) { 'completed' } else { $States[$index] }
 		$artifacts = @()
 		if ($state -eq 'completed' -or $state -eq 'completed_with_warnings') {
-			$artifacts = foreach ($path in $ArtifactPaths) {
-				[ordered]@{ path = $path; committed = $Committed }
+			$artifacts = for ($outputIndex = 0; $outputIndex -lt $assets.Count; $outputIndex++) {
+				$view = if ($Views.Count -ne 0) { $Views[$outputIndex] } elseif ($outputIndex -eq 0) { 'left_eye' } elseif ($outputIndex -eq 1) { 'right_eye' } else { 'framed_combined' }
+				[ordered]@{
+					path = $assets[$outputIndex].path
+					committed = $assets[$outputIndex].committed
+					bytes = $assets[$outputIndex].bytes
+					sha256 = $assets[$outputIndex].sha256
+					actual = [ordered]@{ view = $view; format = $assets[$outputIndex].format; colourContract = 'sdr_srgb' }
+				}
 			}
 		}
 		$children += [ordered]@{
@@ -57,17 +88,21 @@ function Write-TestManifest {
 		}
 	}
 	$outputs = for ($index = 0; $index -lt $Suffixes.Count; $index++) {
-		$view = if ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
-		[ordered]@{ view = $view; nameSuffix = $Suffixes[$index] }
+		$view = if ($Views.Count -ne 0) { $Views[$index] } elseif ($index -eq 0) { 'left_eye' } elseif ($index -eq 1) { 'right_eye' } else { 'framed_combined' }
+		[ordered]@{
+			view = $view
+			nameSuffix = $Suffixes[$index]
+			encoding = [ordered]@{ format = $assets[$index].format; colourContract = 'sdr_srgb' }
+		}
 	}
 	$written = @($children | Where-Object { $_.state -eq 'completed' -or $_.state -eq 'completed_with_warnings' }).Count
 	$dropped = @($children | Where-Object { $_.state -eq 'dropped' }).Count
 	$document = [ordered]@{
 		contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
 		sessionId = 'fixture-session'
-		requestId = 'fixture-sequence'
+		requestId = $RequestId
 		state = 'final'
-		capture = [ordered]@{ outputs = @($outputs) }
+		effective = [ordered]@{ outputs = @($outputs) }
 		updatedUtc = '2026-09-09T00:00:00.000Z'
 		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; written = $written; dropped = $dropped; failed = 0; inFlight = 0 }
 		children = $children
@@ -76,8 +111,11 @@ function Write-TestManifest {
 }
 
 function Invoke-ExpectedFailure {
-	param([Parameter(Mandatory)] [string] $Sequence)
-	& $Executable --expect-failure $Sequence
+	param(
+		[Parameter(Mandatory)] [string] $Sequence,
+		[string] $RequestId = 'fixture-sequence'
+	)
+	& $Executable --expect-failure $RequestId $Sequence
 	if ($LASTEXITCODE -ne 0) {
 		throw "Composer did not safely reject fixture $Sequence (exit $LASTEXITCODE)."
 	}
@@ -93,9 +131,12 @@ function Get-TreeHashes {
 }
 
 function Invoke-ExpectedFailureWithoutWrites {
-	param([Parameter(Mandatory)] [string] $Sequence)
+	param(
+		[Parameter(Mandatory)] [string] $Sequence,
+		[string] $RequestId = 'fixture-sequence'
+	)
 	$before = Get-TreeHashes -Root $resolvedWorkRoot
-	Invoke-ExpectedFailure -Sequence $Sequence
+	Invoke-ExpectedFailure -Sequence $Sequence -RequestId $RequestId
 	$after = Get-TreeHashes -Root $resolvedWorkRoot
 	if ($before.Count -ne $after.Count) {
 		throw "Rejected manifest changed the fixture inventory: $Sequence"
@@ -111,9 +152,10 @@ function Invoke-CompositionWithSampleCount {
 	param(
 		[Parameter(Mandatory)] [string] $Sequence,
 		[Parameter(Mandatory)] [string] $Output,
-		[Parameter(Mandatory)] [int] $ExpectedCount
+		[Parameter(Mandatory)] [int] $ExpectedCount,
+		[string] $RequestId = 'fixture-sequence'
 	)
-	& $Executable $Sequence
+	& $Executable $RequestId $Sequence
 	if ($LASTEXITCODE -ne 0) {
 		throw "Composer rejected valid fixture $Sequence (exit $LASTEXITCODE)."
 	}
@@ -142,9 +184,9 @@ $colors = @(
 $manifestChildren = @()
 $formats = @(
     @{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp },
-    @{ Extension = '.png'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Png },
     @{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp },
-    @{ Extension = '.png'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Png }
+	@{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp },
+	@{ Extension = '.bmp'; ImageFormat = [System.Drawing.Imaging.ImageFormat]::Bmp }
 )
 for ($index = 0; $index -lt $colors.Count; $index++) {
     $name = ('frame_{0:D9}{1}' -f ($index + 1), $formats[$index].Extension)
@@ -173,6 +215,8 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
             $bitmap.Dispose()
         }
     }
+	$leftPath = Join-Path $leftFrames $name
+	$rightPath = Join-Path $rightFrames $name
 	$manifestChildren += [ordered]@{
 		ordinal = $index + 1
 		requestId = "smoke-frame-$($index + 1)"
@@ -180,8 +224,20 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
 		scheduledEngineFrame = [uint64](100 + ($index * 12))
 		scheduledTimestampUs = [uint64](1000000 + @(0, 16667, 50001, 66668)[$index])
 		artifacts = @(
-			[ordered]@{ path = (Join-Path $leftFrames $name); committed = $true },
-			[ordered]@{ path = (Join-Path $rightFrames $name); committed = $true }
+			[ordered]@{
+				path = ([System.IO.Path]::GetRelativePath($sequence, $leftPath) -replace '\\', '/')
+				committed = $true
+				bytes = [uint64](Get-Item -LiteralPath $leftPath).Length
+				sha256 = (Get-FileHash -LiteralPath $leftPath -Algorithm SHA256).Hash.ToLowerInvariant()
+				actual = [ordered]@{ view = 'left_eye'; format = 'bmp'; colourContract = 'sdr_srgb' }
+			},
+			[ordered]@{
+				path = ([System.IO.Path]::GetRelativePath($sequence, $rightPath) -replace '\\', '/')
+				committed = $true
+				bytes = [uint64](Get-Item -LiteralPath $rightPath).Length
+				sha256 = (Get-FileHash -LiteralPath $rightPath -Algorithm SHA256).Hash.ToLowerInvariant()
+				actual = [ordered]@{ view = 'right_eye'; format = 'bmp'; colourContract = 'sdr_srgb' }
+			}
 		)
 		error = $null
 	}
@@ -204,10 +260,10 @@ $manifest = [ordered]@{
 	sessionId = 'smoke-session'
 	requestId = 'smoke-sequence'
 	state = 'final'
-	capture = [ordered]@{
+	effective = [ordered]@{
 		outputs = @(
-			[ordered]@{ view = 'left_eye'; nameSuffix = 'left' },
-			[ordered]@{ view = 'right_eye'; nameSuffix = 'right' }
+			[ordered]@{ view = 'left_eye'; nameSuffix = 'left'; encoding = [ordered]@{ format = 'bmp'; colourContract = 'sdr_srgb' } },
+			[ordered]@{ view = 'right_eye'; nameSuffix = 'right'; encoding = [ordered]@{ format = 'bmp'; colourContract = 'sdr_srgb' } }
 		)
 	}
     updatedUtc = '2026-08-24T00:00:01.000Z'
@@ -225,7 +281,7 @@ $oldPredictableTemporary = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs.
 Set-Content -LiteralPath $oldPredictableTemporary -Value 'unrelated pre-existing file' -Encoding ascii -NoNewline
 $oldTemporaryHash = (Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash
 
-& $Executable $sequence
+& $Executable 'smoke-sequence' $sequence
 if ($LASTEXITCODE -ne 0) {
     throw "Composer smoke executable failed with exit code $LASTEXITCODE."
 }
@@ -253,21 +309,64 @@ foreach ($monoOutput in @('CS_sequence_smoke_1-left.mp4', 'CS_sequence_smoke_1-r
 	}
 }
 
+$largeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_large_stereo'
+$largeLeft = Join-Path $largeSequence 'frame_000001_left.bmp'
+$largeRight = Join-Path $largeSequence 'frame_000001_right.bmp'
+New-Item -ItemType Directory -Force -Path $largeSequence | Out-Null
+foreach ($fixture in @(
+	@{ Path = $largeLeft; Color = [System.Drawing.Color]::Crimson },
+	@{ Path = $largeRight; Color = [System.Drawing.Color]::SeaGreen }
+)) {
+	$bitmap = [System.Drawing.Bitmap]::new(2592, 2592)
+	try {
+		$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+		try { $graphics.Clear($fixture.Color) } finally { $graphics.Dispose() }
+		$bitmap.Save($fixture.Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+	} finally {
+		$bitmap.Dispose()
+	}
+}
+Write-TestManifest -Sequence $largeSequence -Suffixes @('left', 'right') `
+	-Timestamps @([uint64]0) -ArtifactPaths @($largeLeft, $largeRight)
+Invoke-CompositionWithSampleCount -Sequence $largeSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_large_stereo-sbs.mp4') -ExpectedCount 1
+
 if ((Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash -ne $oldTemporaryHash) {
 	throw 'Composition changed a pre-existing predictable temporary file.'
 }
 
-& $Executable --race $sequence
+$raceSequence = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race'
+Copy-Item -LiteralPath $sequence -Destination $raceSequence -Recurse
+& $Executable --race 'smoke-sequence' $raceSequence
 if ($LASTEXITCODE -ne 0) {
 	throw "Concurrent composer admission test failed with exit code $LASTEXITCODE."
 }
-$numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
-if (-not (Test-Path -LiteralPath $numberedOutput -PathType Leaf)) {
-	throw 'Concurrent composition did not preserve the original SBS output with a numbered filename.'
+$numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race-sbs-2.mp4'
+if (Test-Path -LiteralPath $numberedOutput -PathType Leaf) {
+	throw 'Idempotent composition unexpectedly created a numbered duplicate output.'
+}
+& $Executable 'smoke-sequence' $sequence
+if ($LASTEXITCODE -eq 0) {
+	throw 'Repeat composition trusted an existing deterministic output without provenance.'
+}
+$repeatOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs-2.mp4'
+if (Test-Path -LiteralPath $repeatOutput -PathType Leaf) {
+	throw 'Repeat composition unexpectedly created a numbered duplicate output.'
 }
 
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
 $rightSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $rightFrames } | Select-Object -First 1
+
+$collisionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision'
+Write-TestManifest -Sequence $collisionSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$collisionOutput = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision-left.mp4'
+Set-Content -LiteralPath $collisionOutput -Value 'unrelated file' -Encoding ascii -NoNewline
+$collisionHash = (Get-FileHash -LiteralPath $collisionOutput -Algorithm SHA256).Hash
+Invoke-ExpectedFailure -Sequence $collisionSequence
+if ((Get-FileHash -LiteralPath $collisionOutput -Algorithm SHA256).Hash -ne $collisionHash) {
+	throw 'Composition changed an unverified deterministic output collision.'
+}
 
 $longSequence = Join-Path $resolvedWorkRoot 'CS_sequence_long_cadence'
 $longTimestamps = @(
@@ -326,7 +425,70 @@ $legacyManifest = [ordered]@{
 	)
 }
 $legacyManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $legacySequence 'sequence.json') -Encoding utf8NoBOM
-Invoke-CompositionWithSampleCount -Sequence $legacySequence -Output (Join-Path $resolvedWorkRoot 'CS_sequence_legacy_tail-left.mp4') -ExpectedCount 3
+Invoke-ExpectedFailure -Sequence $legacySequence
+
+$requestMismatchSequence = Join-Path $resolvedWorkRoot 'CS_sequence_request_mismatch'
+Write-TestManifest -Sequence $requestMismatchSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+Invoke-ExpectedFailure -Sequence $requestMismatchSequence -RequestId 'different-sequence'
+
+$absoluteSequence = Join-Path $resolvedWorkRoot 'CS_sequence_absolute_asset'
+Write-TestManifest -Sequence $absoluteSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$absoluteManifestPath = Join-Path $absoluteSequence 'sequence.json'
+$absoluteManifest = Get-Content -LiteralPath $absoluteManifestPath -Raw | ConvertFrom-Json
+$absoluteManifest.children[0].artifacts[0].path = $leftSource.FullName
+$absoluteManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $absoluteManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $absoluteSequence
+
+$traversalSequence = Join-Path $resolvedWorkRoot 'CS_sequence_traversal_asset'
+Write-TestManifest -Sequence $traversalSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$traversalExternal = Join-Path $resolvedWorkRoot 'traversal-external.bmp'
+Copy-Item -LiteralPath $leftSource.FullName -Destination $traversalExternal -Force
+$traversalManifestPath = Join-Path $traversalSequence 'sequence.json'
+$traversalManifest = Get-Content -LiteralPath $traversalManifestPath -Raw | ConvertFrom-Json
+$traversalManifest.children[0].artifacts[0].path = '../traversal-external.bmp'
+$traversalManifest.children[0].artifacts[0].bytes = [uint64](Get-Item -LiteralPath $traversalExternal).Length
+$traversalManifest.children[0].artifacts[0].sha256 = (Get-FileHash -LiteralPath $traversalExternal -Algorithm SHA256).Hash.ToLowerInvariant()
+$traversalManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $traversalManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $traversalSequence
+
+$reparseSequence = Join-Path $resolvedWorkRoot 'CS_sequence_reparse_asset'
+Write-TestManifest -Sequence $reparseSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$reparseAssets = Join-Path $reparseSequence 'assets'
+$reparseTarget = Join-Path $resolvedWorkRoot 'reparse-target'
+New-Item -ItemType Directory -Force -Path $reparseTarget | Out-Null
+Copy-Item -LiteralPath (Join-Path $reparseAssets 'output-0.bmp') -Destination (Join-Path $reparseTarget 'output-0.bmp') -Force
+Remove-Item -LiteralPath $reparseAssets -Recurse -Force
+New-Item -ItemType Junction -Path $reparseAssets -Target $reparseTarget | Out-Null
+Invoke-ExpectedFailureWithoutWrites -Sequence $reparseSequence
+
+$hashMismatchSequence = Join-Path $resolvedWorkRoot 'CS_sequence_hash_mismatch'
+Write-TestManifest -Sequence $hashMismatchSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+Copy-Item -LiteralPath $rightSource.FullName `
+	-Destination (Join-Path $hashMismatchSequence 'assets/output-0.bmp') -Force
+Invoke-ExpectedFailureWithoutWrites -Sequence $hashMismatchSequence
+
+$sizeMismatchSequence = Join-Path $resolvedWorkRoot 'CS_sequence_size_mismatch'
+Write-TestManifest -Sequence $sizeMismatchSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+Add-Content -LiteralPath (Join-Path $sizeMismatchSequence 'assets/output-0.bmp') -Value 'x' -Encoding ascii -NoNewline
+Invoke-ExpectedFailureWithoutWrites -Sequence $sizeMismatchSequence
+
+$reorderedStereoSequence = Join-Path $resolvedWorkRoot 'CS_sequence_reordered_stereo'
+Write-TestManifest -Sequence $reorderedStereoSequence -Suffixes @('left', 'right') `
+	-Views @('left_eye', 'right_eye') -Timestamps @([uint64]1000) `
+	-ArtifactPaths @($leftSource.FullName, $rightSource.FullName)
+$reorderedManifestPath = Join-Path $reorderedStereoSequence 'sequence.json'
+$reorderedManifest = Get-Content -LiteralPath $reorderedManifestPath -Raw | ConvertFrom-Json
+$firstArtifact = $reorderedManifest.children[0].artifacts[0]
+$reorderedManifest.children[0].artifacts[0] = $reorderedManifest.children[0].artifacts[1]
+$reorderedManifest.children[0].artifacts[1] = $firstArtifact
+$reorderedManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reorderedManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $reorderedStereoSequence
 
 $unsafeSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unsafe'
 Write-TestManifest -Sequence $unsafeSequence -Suffixes @('../outside') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
@@ -335,6 +497,19 @@ Invoke-ExpectedFailure -Sequence $unsafeSequence
 $duplicateSequence = Join-Path $resolvedWorkRoot 'CS_sequence_duplicate'
 Write-TestManifest -Sequence $duplicateSequence -Suffixes @('left', 'LEFT') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName)
 Invoke-ExpectedFailure -Sequence $duplicateSequence
+
+$legacyRedundantSequence = Join-Path $resolvedWorkRoot 'CS_sequence_redundant_stereo'
+Write-TestManifest -Sequence $legacyRedundantSequence -Suffixes @('side_by_side', 'left', 'right') `
+	-Views @('side_by_side', 'left_eye', 'right_eye') -Timestamps @([uint64]1000) `
+	-ArtifactPaths @($leftSource.FullName, $leftSource.FullName, $rightSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $legacyRedundantSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_redundant_stereo-sbs.mp4') -ExpectedCount 1
+
+$singleSbsSequence = Join-Path $resolvedWorkRoot 'CS_sequence_single_sbs'
+Write-TestManifest -Sequence $singleSbsSequence -Suffixes @('sbs') -Views @('side_by_side') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+Invoke-CompositionWithSampleCount -Sequence $singleSbsSequence `
+	-Output (Join-Path $resolvedWorkRoot 'CS_sequence_single_sbs-sbs.mp4') -ExpectedCount 1
 
 $tooManyOutputsSequence = Join-Path $resolvedWorkRoot 'CS_sequence_too_many_outputs'
 Write-TestManifest -Sequence $tooManyOutputsSequence -Suffixes @('left', 'right', 'combined') -Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName, $rightSource.FullName, $leftSource.FullName)
@@ -405,16 +580,13 @@ $aliasSource = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left.mp4'
 Copy-Item -LiteralPath $leftSource.FullName -Destination $aliasSource
 $aliasHash = (Get-FileHash -LiteralPath $aliasSource -Algorithm SHA256).Hash
 Write-TestManifest -Sequence $aliasSequence -Suffixes @('left') -Timestamps @([uint64]1000) -ArtifactPaths @($aliasSource)
-& $Executable $aliasSequence
-if ($LASTEXITCODE -ne 0) {
-	throw 'Composer could not avoid an existing source/output name collision.'
-}
+Invoke-ExpectedFailure -Sequence $aliasSequence
 if ((Get-FileHash -LiteralPath $aliasSource -Algorithm SHA256).Hash -ne $aliasHash) {
 	throw 'Composition changed a source file that occupied the default output name.'
 }
 $aliasOutput = Join-Path $resolvedWorkRoot 'CS_sequence_alias-left-2.mp4'
-if (-not (Test-Path -LiteralPath $aliasOutput -PathType Leaf)) {
-	throw 'Composer did not select a non-conflicting final output name.'
+if (Test-Path -LiteralPath $aliasOutput -PathType Leaf) {
+	throw 'Rejected source/output collision created a numbered output.'
 }
 
 foreach ($source in $sourceFiles) {

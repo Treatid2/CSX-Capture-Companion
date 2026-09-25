@@ -1,14 +1,19 @@
 [CmdletBinding()]
 param(
     [string[]] $ImportPath = @(),
-    [string] $CompilerWrapper = 'L:\Codex\shared\tools\papyrus-compiler\Invoke-PapyrusCompiler.ps1'
+    [string] $CompilerWrapper = 'L:\Codex\shared\tools\papyrus-compiler\Invoke-PapyrusCompiler.ps1',
+    [string] $OutputDirectory = 'build\papyrus\Release'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $sourcePath = Join-Path $projectRoot 'Data\Scripts\Source'
-$outputPath = Join-Path $projectRoot 'build\papyrus\Release'
+$outputPath = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    [System.IO.Path]::GetFullPath($OutputDirectory)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory))
+}
 $dataPath = Join-Path $projectRoot 'Data\Scripts'
 
 if (-not (Test-Path -LiteralPath $CompilerWrapper -PathType Leaf)) {
