@@ -55,7 +55,7 @@ namespace
 					std::this_thread::sleep_for(5ms);
 				return json{ { "ok", true }, { "result", { { "requestId", "still-A" } } } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[](std::string) {});
 
 		const auto started = std::chrono::steady_clock::now();
@@ -80,7 +80,7 @@ namespace
 					std::this_thread::sleep_for(5ms);
 				return json{ { "ok", true }, { "result", { { "requestId", "blocked" } } } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "Capture command rejected - companion queue is full")
 					++saturationNotices;
@@ -158,7 +158,7 @@ namespace
 				}
 				return json{ { "ok", false } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -185,6 +185,7 @@ namespace
 		std::atomic_int transientRefreshes{ 0 };
 		std::mutex composedMutex;
 		std::filesystem::path composed;
+		std::string composedRequestId;
 		CaptureController controller(
 			[&](json request) {
 				const auto action = request.at("action").get<std::string>();
@@ -213,9 +214,10 @@ namespace
 				}
 				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "running" } } } };
 			},
-			[&](const std::filesystem::path& a_manifest) {
+			[&](const std::filesystem::path& a_manifest, std::string a_requestId) {
 				std::lock_guard lock(composedMutex);
 				composed = a_manifest;
+				composedRequestId = std::move(a_requestId);
 				return true;
 			},
 			[](std::string) {});
@@ -235,7 +237,9 @@ namespace
 		return Check(completed, "The terminal stop receipt was not composed.") &&
 		       Check(transientRefreshes >= 2, "A transient receipt failure was not retried.") &&
 		       Check(composed == std::filesystem::path("D:/captures/A/sequence.json"),
-			       "Composition received the wrong manifest path.");
+			       "Composition received the wrong manifest path.") &&
+		       Check(composedRequestId == "A",
+			       "Composition did not retain the terminal sequence request identity.");
 	}
 
 	bool TestToggleTerminalResolvesDeferredCompose()
@@ -243,6 +247,7 @@ namespace
 		std::atomic_int refreshes{ 0 };
 		std::mutex composedMutex;
 		std::vector<std::filesystem::path> composed;
+		std::vector<std::string> composedRequestIds;
 		CaptureController controller(
 			[&](json request) {
 				const auto action = request.at("action").get<std::string>();
@@ -267,9 +272,10 @@ namespace
 				}
 				return json{ { "ok", false } };
 			},
-			[&](const std::filesystem::path& manifest) {
+			[&](const std::filesystem::path& manifest, std::string requestId) {
 				std::lock_guard lock(composedMutex);
 				composed.push_back(manifest);
+				composedRequestIds.push_back(std::move(requestId));
 				return true;
 			},
 			[](std::string) {});
@@ -295,8 +301,10 @@ namespace
 		       Check(composed.size() == 1,
 				   "The terminal toggle composed more than once.") &&
 		       Check(composed.front() ==
-						 std::filesystem::path("D:/captures/race/sequence.json"),
-				   "The terminal toggle composed the wrong recording.");
+					 std::filesystem::path("D:/captures/race/sequence.json"),
+				   "The terminal toggle composed the wrong recording.") &&
+		       Check(composedRequestIds == std::vector<std::string>{ "race" },
+			       "Deferred composition lost the owned request identity.");
 	}
 
 	bool TestDeferredComposeDoesNotUseOlderManifest()
@@ -330,7 +338,7 @@ namespace
 						{ "result", { { "requestId", "B" }, { "state", "failed" } } } };
 				return json{ { "ok", false } };
 			},
-			[&](const std::filesystem::path& manifest) {
+			[&](const std::filesystem::path& manifest, std::string) {
 				std::lock_guard lock(resultMutex);
 				composed.push_back(manifest);
 				return true;
@@ -383,7 +391,7 @@ namespace
 				++receiptPolls;
 				return json{ { "ok", false }, { "error", { { "code", "request_not_found" } } } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -460,7 +468,7 @@ namespace
 					{ "result", { { "requestId", "transient" }, { "state", "running" } } }
 				};
 			},
-			[](const std::filesystem::path&) { return true; }, [](std::string) {});
+			[](const std::filesystem::path&, std::string) { return true; }, [](std::string) {});
 
 		if (!Check(controller.QueueToggle(StartRequest()),
 				"The transient capture did not queue.") ||
@@ -495,7 +503,7 @@ namespace
 				}
 				return json{ { "ok", false } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "No completed capture is ready")
 					std::this_thread::sleep_for(5ms);
@@ -554,7 +562,7 @@ namespace
 						{ { "requestId", request.at("requestId") }, { "state", "encoding" } } },
 				};
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -612,7 +620,7 @@ namespace
 					{ "manifest", { { "finalPath", std::format("D:/captures/{}/sequence.json", id) } } },
 				} } };
 			},
-			[&](const std::filesystem::path& manifest) {
+			[&](const std::filesystem::path& manifest, std::string) {
 				std::lock_guard lock(resultMutex);
 				composed.push_back(manifest);
 				return true;
@@ -686,7 +694,7 @@ namespace
 					{ "manifest", { { "finalPath", stopped ? json("D:/captures/owned/sequence.json") : json(nullptr) } } },
 				} } };
 			},
-			[&](const std::filesystem::path&) { ++composed; return true; },
+			[&](const std::filesystem::path&, std::string) { ++composed; return true; },
 			[&](std::string message) {
 				std::lock_guard lock(resultMutex);
 				notifications.push_back(std::move(message));
@@ -736,7 +744,7 @@ namespace
 				return json{ { "ok", true }, { "result", { { "requestId", id },
 					{ "state", id == "still-17" ? "completed" : polls % 2 ? "unknown" : "" } } } };
 			},
-			[](const std::filesystem::path&) { return true; },
+			[](const std::filesystem::path&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "Screenshot status unavailable - see CSXCaptureCompanion.log")
 					++unavailable;

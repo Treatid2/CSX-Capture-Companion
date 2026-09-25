@@ -152,8 +152,10 @@ namespace CSXCaptureCompanion
 		if (activeRequestId != requestId)
 			return { .state = lastState };
 		if (update.terminal) {
-			if (hasManifest)
+			if (hasManifest) {
 				latestManifest = std::move(manifest);
+				latestManifestRequestId = requestId;
+			}
 			activeRequestId.clear();
 		}
 		lastState = code;
@@ -205,8 +207,10 @@ namespace CSXCaptureCompanion
 			if (activeRequestId != requestId)
 				return {};
 			if (update.terminal) {
-				if (hasManifest)
+				if (hasManifest) {
 					latestManifest = std::move(manifest);
+					latestManifestRequestId = requestId;
+				}
 				activeRequestId.clear();
 			}
 			lastState = code;
@@ -224,6 +228,7 @@ namespace CSXCaptureCompanion
 		activeRequestId = std::move(requestId);
 		// A newer accepted attempt supersedes automatic composition eligibility.
 		latestManifest.clear();
+		latestManifestRequestId.clear();
 		lastState = 1;
 		return { .requestId = activeRequestId, .state = 1, .accepted = true };
 	}
@@ -235,6 +240,7 @@ namespace CSXCaptureCompanion
 		auto abandoned = std::move(activeRequestId);
 		activeRequestId.clear();
 		latestManifest.clear();
+		latestManifestRequestId.clear();
 		lastState = 0;
 		return abandoned;
 	}
@@ -255,6 +261,18 @@ namespace CSXCaptureCompanion
 	{
 		std::lock_guard stateLock(stateMutex);
 		return latestManifest;
+	}
+
+	std::string CaptureSession::LatestManifestRequestId() const
+	{
+		std::lock_guard stateLock(stateMutex);
+		return latestManifestRequestId;
+	}
+
+	CompletedCapture CaptureSession::LatestCompletedCapture() const
+	{
+		std::lock_guard stateLock(stateMutex);
+		return { latestManifest, latestManifestRequestId };
 	}
 
 	std::string CaptureSession::ActiveRequestId() const

@@ -183,9 +183,10 @@ namespace CSXCaptureCompanion
 				pendingComposeRequestId = active;
 				notify("Composition queued until capture finishes");
 				PollCapture();
-			} else if (!session.LatestManifest().empty()) {
+			} else if (const auto completed = session.LatestCompletedCapture();
+				!completed.manifest.empty() && !completed.requestId.empty()) {
 				pendingComposeRequestId.clear();
-				if (!compose(session.LatestManifest()))
+				if (!compose(completed.manifest, completed.requestId))
 					SKSE::log::warn("Video composition request was not accepted");
 			} else {
 				SKSE::log::warn(
@@ -288,7 +289,7 @@ namespace CSXCaptureCompanion
 			notify("Capture finished without a composable manifest");
 			return;
 		}
-		if (!compose(a_update.manifest))
+		if (!compose(a_update.manifest, a_update.requestId))
 			SKSE::log::warn("Deferred video composition request was not accepted");
 	}
 

@@ -31,6 +31,12 @@ namespace CSXCaptureCompanion
 		bool hasManifest{ false };
 	};
 
+	struct CompletedCapture
+	{
+		std::filesystem::path manifest;
+		std::string requestId;
+	};
+
 	[[nodiscard]] bool
 	IsSuccessfulResponse(const nlohmann::json& a_response) noexcept;
 	[[nodiscard]] std::string
@@ -53,6 +59,10 @@ namespace CSXCaptureCompanion
 		[[nodiscard]] std::int32_t CachedState() const;
 		/// Return the eligible terminal manifest of the latest accepted attempt.
 		[[nodiscard]] std::filesystem::path LatestManifest() const;
+		/// Return the request identity bound to the eligible terminal manifest.
+		[[nodiscard]] std::string LatestManifestRequestId() const;
+		/// Return the terminal manifest and request identity from one state snapshot.
+		[[nodiscard]] CompletedCapture LatestCompletedCapture() const;
 		[[nodiscard]] std::string ActiveRequestId() const;
 
 	private:
@@ -63,6 +73,7 @@ namespace CSXCaptureCompanion
 		mutable std::mutex stateMutex;
 		std::string activeRequestId;
 		std::filesystem::path latestManifest;
+		std::string latestManifestRequestId;
 		std::int32_t lastState{ 0 };
 	};
 }

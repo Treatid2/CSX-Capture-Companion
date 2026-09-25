@@ -32,12 +32,16 @@ namespace CSXCaptureCompanion
 		VideoComposer& operator=(const VideoComposer&) = delete;
 		VideoComposer& operator=(VideoComposer&&) = delete;
 
-		bool Queue(const std::filesystem::path& a_sequenceDirectory);
+		bool Queue(
+			const std::filesystem::path& a_sequenceDirectory,
+			std::string a_expectedRequestId);
 		[[nodiscard]] ComposeState GetState() const noexcept;
 		[[nodiscard]] std::string GetStatusText() const;
 
 	private:
-		void Run(std::filesystem::path a_sequenceDirectory);
+		void Run(
+			std::filesystem::path a_sequenceDirectory,
+			std::string a_expectedRequestId);
 		void SetStatus(ComposeState a_state, std::string a_text);
 
 		std::atomic<ComposeState> state{ ComposeState::kIdle };

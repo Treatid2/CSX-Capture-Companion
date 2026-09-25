@@ -43,6 +43,7 @@ target_link_libraries(
         mfuuid
         windowscodecs
         ole32
+		bcrypt
 )
 
 if(MSVC)
@@ -103,6 +104,7 @@ if(BUILD_TESTING)
             mfuuid
             windowscodecs
             ole32
+			bcrypt
     )
     if(MSVC)
         target_compile_options(CSXCaptureComposerSmoke PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
@@ -152,6 +154,7 @@ if(BUILD_TESTING)
 			mfuuid
 			windowscodecs
 			ole32
+			bcrypt
 	)
 	if(MSVC)
 		target_compile_options(CSXCaptureControllerTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

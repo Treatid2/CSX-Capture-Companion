@@ -231,7 +231,9 @@ namespace
 		       Check(starts == 1, "A stop toggle restarted a capture that had just become terminal.") &&
 		       Check(session.ActiveRequestId().empty(), "A terminal capture remained active after acknowledgement.") &&
 		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
-			       "The acknowledged terminal capture did not retain its manifest.");
+			       "The acknowledged terminal capture did not retain its manifest.") &&
+		       Check(session.LatestManifestRequestId() == "A",
+			       "The acknowledged terminal capture did not retain its request identity.");
 	}
 
 	bool TestPermanentRefreshClassification()

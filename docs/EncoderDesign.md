@@ -67,7 +67,13 @@ quitting Skyrim when immediate process exit matters.
 Before encoding, the worker validates every source, output, temporary path, and
 output suffix as one plan. It accepts at most two output streams, bounds the
 manifest and timeline sizes, and consumes only artifacts marked committed by
-CSX. Outputs are unique leaf names beside the frame-set directory and cannot
+CSX. Composition also requires the exact completed sequence request ID, the
+artifact's selected view/format/colour contract, and its committed byte count
+and SHA-256. It rejects legacy manifests, rooted or traversing paths, and any
+sequence or artifact path containing a reparse point. Each source file is held
+without write/delete sharing while its current size and digest are verified
+immediately before WIC decodes it. Outputs are unique leaf names beside the
+frame-set directory and cannot
 alias a source. Each job uses a new temporary name; an unrelated pre-existing
 temporary file is never removed. A temporary output is renamed with
 write-through semantics only after `IMFSinkWriter::Finalize` succeeds. The
