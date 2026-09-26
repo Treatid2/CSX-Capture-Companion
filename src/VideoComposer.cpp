@@ -55,6 +55,8 @@ namespace CSXCaptureCompanion
 			std::filesystem::path path;
 			std::uint64_t expectedBytes{};
 			std::string expectedSha256;
+			std::uint32_t expectedWidth{};
+			std::uint32_t expectedHeight{};
 		};
 
 		struct StreamPlan
@@ -335,6 +337,16 @@ namespace CSXCaptureCompanion
 			if (!a_object.is_object() || !a_object.contains(a_name) || !a_object[a_name].is_number_unsigned())
 				throw std::runtime_error("A sequence frame has an invalid timestamp.");
 			return a_object[a_name].get<std::uint64_t>();
+		}
+
+		std::uint32_t ReadDimension(const json& a_object, std::string_view a_name)
+		{
+			if (!a_object.is_object() || !a_object.contains(a_name) || !a_object[a_name].is_number_unsigned())
+				throw std::runtime_error("A completed artifact has an invalid image dimension.");
+			const auto value = a_object[a_name].get<std::uint64_t>();
+			if (value == 0 || value > std::numeric_limits<std::uint32_t>::max())
+				throw std::runtime_error("A completed artifact has an invalid image dimension.");
+			return static_cast<std::uint32_t>(value);
 		}
 
 		bool IsWrittenChildState(std::string_view a_state)
@@ -637,8 +649,14 @@ namespace CSXCaptureCompanion
 						std::ranges::transform(digest, digest.begin(), [](unsigned char a_character) {
 							return static_cast<char>(std::tolower(a_character));
 						});
-						plans[index].frames.push_back(
-							{ timestamp, path, artifact["bytes"].get<std::uint64_t>(), std::move(digest) });
+						plans[index].frames.push_back({
+							timestamp,
+							path,
+							artifact["bytes"].get<std::uint64_t>(),
+							std::move(digest),
+							ReadDimension(actual, "width"),
+							ReadDimension(actual, "height"),
+						});
 					}
 				}
 			}
@@ -805,6 +823,10 @@ namespace CSXCaptureCompanion
 			Check(converter->GetSize(&decoded.sourceWidth, &decoded.sourceHeight), "IWICBitmapSource::GetSize");
 			if (decoded.sourceWidth < 2 || decoded.sourceHeight < 2) {
 				throw std::runtime_error("A source frame has invalid dimensions.");
+			}
+			if (decoded.sourceWidth != a_source.expectedWidth ||
+				decoded.sourceHeight != a_source.expectedHeight) {
+				throw std::runtime_error("A source frame no longer matches its committed dimensions.");
 			}
 			decoded.width = decoded.sourceWidth;
 			decoded.height = decoded.sourceHeight;

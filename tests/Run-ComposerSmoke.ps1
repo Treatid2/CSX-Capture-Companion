@@ -53,12 +53,21 @@ function Write-TestManifest {
 			Copy-Item -LiteralPath $source.FullName -Destination $destination -Force
 		}
 		$asset = Get-Item -LiteralPath $destination
+		$image = [System.Drawing.Image]::FromFile($asset.FullName)
+		try {
+			$width = [uint32]$image.Width
+			$height = [uint32]$image.Height
+		} finally {
+			$image.Dispose()
+		}
 		$assets += [ordered]@{
 			path = "assets/$($asset.Name)"
 			committed = $Committed
 			bytes = [uint64]$asset.Length
 			sha256 = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 			format = $format
+			width = $width
+			height = $height
 		}
 	}
 	$children = @()
@@ -73,7 +82,13 @@ function Write-TestManifest {
 					committed = $assets[$outputIndex].committed
 					bytes = $assets[$outputIndex].bytes
 					sha256 = $assets[$outputIndex].sha256
-					actual = [ordered]@{ view = $view; format = $assets[$outputIndex].format; colourContract = 'sdr_srgb' }
+					actual = [ordered]@{
+						view = $view
+						width = $assets[$outputIndex].width
+						height = $assets[$outputIndex].height
+						format = $assets[$outputIndex].format
+						colourContract = 'sdr_srgb'
+					}
 				}
 			}
 		}
@@ -83,7 +98,12 @@ function Write-TestManifest {
 			state = $state
 			scheduledEngineFrame = [uint64](200 + $index)
 			scheduledTimestampUs = $Timestamps[$index]
+			requested = [ordered]@{}
+			effective = [ordered]@{}
+			actual = [ordered]@{}
 			artifacts = @($artifacts)
+			warnings = @()
+			errors = @()
 			error = $null
 		}
 	}
@@ -99,13 +119,23 @@ function Write-TestManifest {
 	$dropped = @($children | Where-Object { $_.state -eq 'dropped' }).Count
 	$document = [ordered]@{
 		contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
+		producer = [ordered]@{ name = 'composer-smoke-fixture' }
 		sessionId = 'fixture-session'
 		requestId = $RequestId
 		state = 'final'
+		terminalOutcome = 'completed'
+		client = [ordered]@{ clientId = 'composer-smoke'; commandId = $RequestId }
+		acceptedUtc = '2026-09-09T00:00:00.000Z'
+		completedUtc = '2026-09-09T00:00:01.000Z'
+		requested = [ordered]@{}
 		effective = [ordered]@{ outputs = @($outputs) }
+		actual = [ordered]@{ children = $children.Count; fallbacksPresent = $false }
 		updatedUtc = '2026-09-09T00:00:00.000Z'
-		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; written = $written; dropped = $dropped; failed = 0; inFlight = 0 }
+		counts = [ordered]@{ requested = $Timestamps.Count; scheduled = $Timestamps.Count; acquired = $written; written = $written; dropped = $dropped; failed = 0; cancelled = 0; inFlight = 0 }
 		children = $children
+		warnings = @()
+		errors = @()
+		packaging = [ordered]@{}
 	}
 	$document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Sequence 'sequence.json') -Encoding utf8NoBOM
 }
@@ -229,16 +259,21 @@ for ($index = 0; $index -lt $colors.Count; $index++) {
 				committed = $true
 				bytes = [uint64](Get-Item -LiteralPath $leftPath).Length
 				sha256 = (Get-FileHash -LiteralPath $leftPath -Algorithm SHA256).Hash.ToLowerInvariant()
-				actual = [ordered]@{ view = 'left_eye'; format = 'bmp'; colourContract = 'sdr_srgb' }
+				actual = [ordered]@{ view = 'left_eye'; width = 64; height = 64; format = 'bmp'; colourContract = 'sdr_srgb' }
 			},
 			[ordered]@{
 				path = ([System.IO.Path]::GetRelativePath($sequence, $rightPath) -replace '\\', '/')
 				committed = $true
 				bytes = [uint64](Get-Item -LiteralPath $rightPath).Length
 				sha256 = (Get-FileHash -LiteralPath $rightPath -Algorithm SHA256).Hash.ToLowerInvariant()
-				actual = [ordered]@{ view = 'right_eye'; format = 'bmp'; colourContract = 'sdr_srgb' }
+				actual = [ordered]@{ view = 'right_eye'; width = 64; height = 64; format = 'bmp'; colourContract = 'sdr_srgb' }
 			}
 		)
+		requested = [ordered]@{}
+		effective = [ordered]@{}
+		actual = [ordered]@{}
+		warnings = @()
+		errors = @()
 		error = $null
 	}
 }
@@ -250,25 +285,40 @@ foreach ($offset in @([uint64]83335, [uint64]100002)) {
 		state = 'dropped'
 		scheduledEngineFrame = [uint64](100 + (($ordinal - 1) * 12))
 		scheduledTimestampUs = [uint64](1000000 + $offset)
+		requested = [ordered]@{}
+		effective = [ordered]@{}
+		actual = [ordered]@{}
 		artifacts = @()
+		warnings = @()
+		errors = @()
 		error = [ordered]@{ code = 'encoder_backpressure'; message = 'fixture drop' }
 	}
 }
 
 $manifest = [ordered]@{
 	contract = [ordered]@{ name = 'csx.screenshot'; major = 1; minor = 0; schemaRevision = 1 }
+	producer = [ordered]@{ name = 'composer-smoke-fixture' }
 	sessionId = 'smoke-session'
 	requestId = 'smoke-sequence'
 	state = 'final'
+	terminalOutcome = 'completed_with_warnings'
+	client = [ordered]@{ clientId = 'composer-smoke'; commandId = 'smoke-sequence' }
+	acceptedUtc = '2026-08-24T00:00:00.000Z'
+	completedUtc = '2026-08-24T00:00:01.000Z'
+	requested = [ordered]@{}
 	effective = [ordered]@{
 		outputs = @(
 			[ordered]@{ view = 'left_eye'; nameSuffix = 'left'; encoding = [ordered]@{ format = 'bmp'; colourContract = 'sdr_srgb' } },
 			[ordered]@{ view = 'right_eye'; nameSuffix = 'right'; encoding = [ordered]@{ format = 'bmp'; colourContract = 'sdr_srgb' } }
 		)
 	}
+	actual = [ordered]@{ children = $manifestChildren.Count; fallbacksPresent = $false }
     updatedUtc = '2026-08-24T00:00:01.000Z'
-	counts = [ordered]@{ requested = 6; scheduled = 6; written = 4; dropped = 2; failed = 0; inFlight = 0 }
+	counts = [ordered]@{ requested = 6; scheduled = 6; acquired = 4; written = 4; dropped = 2; failed = 0; cancelled = 0; inFlight = 0 }
 	children = $manifestChildren
+	warnings = @()
+	errors = @()
+	packaging = [ordered]@{}
 }
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $sequence 'sequence.json') -Encoding utf8NoBOM
 
@@ -478,6 +528,42 @@ Write-TestManifest -Sequence $sizeMismatchSequence -Suffixes @('left') `
 Add-Content -LiteralPath (Join-Path $sizeMismatchSequence 'assets/output-0.bmp') -Value 'x' -Encoding ascii -NoNewline
 Invoke-ExpectedFailureWithoutWrites -Sequence $sizeMismatchSequence
 
+$missingWidthSequence = Join-Path $resolvedWorkRoot 'CS_sequence_missing_width'
+Write-TestManifest -Sequence $missingWidthSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$missingWidthManifestPath = Join-Path $missingWidthSequence 'sequence.json'
+$missingWidthManifest = Get-Content -LiteralPath $missingWidthManifestPath -Raw | ConvertFrom-Json
+$missingWidthManifest.children[0].artifacts[0].actual.PSObject.Properties.Remove('width')
+$missingWidthManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $missingWidthManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $missingWidthSequence
+
+$missingHeightSequence = Join-Path $resolvedWorkRoot 'CS_sequence_missing_height'
+Write-TestManifest -Sequence $missingHeightSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$missingHeightManifestPath = Join-Path $missingHeightSequence 'sequence.json'
+$missingHeightManifest = Get-Content -LiteralPath $missingHeightManifestPath -Raw | ConvertFrom-Json
+$missingHeightManifest.children[0].artifacts[0].actual.PSObject.Properties.Remove('height')
+$missingHeightManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $missingHeightManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $missingHeightSequence
+
+$zeroDimensionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_zero_dimension'
+Write-TestManifest -Sequence $zeroDimensionSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$zeroDimensionManifestPath = Join-Path $zeroDimensionSequence 'sequence.json'
+$zeroDimensionManifest = Get-Content -LiteralPath $zeroDimensionManifestPath -Raw | ConvertFrom-Json
+$zeroDimensionManifest.children[0].artifacts[0].actual.width = 0
+$zeroDimensionManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $zeroDimensionManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $zeroDimensionSequence
+
+$dimensionMismatchSequence = Join-Path $resolvedWorkRoot 'CS_sequence_dimension_mismatch'
+Write-TestManifest -Sequence $dimensionMismatchSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$dimensionMismatchManifestPath = Join-Path $dimensionMismatchSequence 'sequence.json'
+$dimensionMismatchManifest = Get-Content -LiteralPath $dimensionMismatchManifestPath -Raw | ConvertFrom-Json
+$dimensionMismatchManifest.children[0].artifacts[0].actual.width = [uint32]65
+$dimensionMismatchManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dimensionMismatchManifestPath -Encoding utf8NoBOM
+Invoke-ExpectedFailureWithoutWrites -Sequence $dimensionMismatchSequence
+
 $reorderedStereoSequence = Join-Path $resolvedWorkRoot 'CS_sequence_reordered_stereo'
 Write-TestManifest -Sequence $reorderedStereoSequence -Suffixes @('left', 'right') `
 	-Views @('left_eye', 'right_eye') -Timestamps @([uint64]1000) `
@@ -600,6 +686,10 @@ $unexpectedOutputs = @(
 	'CS_sequence_duplicate-sbs.mp4',
 	'CS_sequence_too_many_outputs-left.mp4',
 	'CS_sequence_uncommitted-left.mp4',
+	'CS_sequence_missing_width-left.mp4',
+	'CS_sequence_missing_height-left.mp4',
+	'CS_sequence_zero_dimension-left.mp4',
+	'CS_sequence_dimension_mismatch-left.mp4',
 	'CS_sequence_duplicate_time-left.mp4',
 	'CS_sequence_decreasing_time-left.mp4',
 	'CS_sequence_negative_time-left.mp4',
