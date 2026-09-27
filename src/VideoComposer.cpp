@@ -17,10 +17,10 @@
 #include <atomic>
 #include <cctype>
 #include <cwctype>
-#include <fstream>
 #include <limits>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -30,6 +30,9 @@ namespace CSXCaptureCompanion
 	namespace
 	{
 		std::atomic<NotificationCallback> g_notificationCallback{ nullptr };
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+		std::atomic<ManifestCustodyTestHook> g_manifestCustodyTestHook{ nullptr };
+#endif
 	}
 
 	void SetNotificationCallback(NotificationCallback a_callback) noexcept
@@ -43,6 +46,13 @@ namespace CSXCaptureCompanion
 			callback(std::move(a_message));
 		}
 	}
+
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+	void SetManifestCustodyTestHook(ManifestCustodyTestHook a_hook) noexcept
+	{
+		g_manifestCustodyTestHook.store(a_hook, std::memory_order_release);
+	}
+#endif
 
 	namespace
 	{
@@ -246,6 +256,34 @@ namespace CSXCaptureCompanion
 			return result;
 		}
 
+		std::string HashBytes(std::span<const std::uint8_t> a_bytes)
+		{
+			AlgorithmHandle algorithm;
+			CheckNtStatus(BCryptOpenAlgorithmProvider(
+				algorithm.Address(), BCRYPT_SHA256_ALGORITHM, nullptr, 0),
+				"BCryptOpenAlgorithmProvider");
+			HashHandle hash;
+			CheckNtStatus(BCryptCreateHash(
+				algorithm.Get(), hash.Address(), nullptr, 0, nullptr, 0, 0),
+				"BCryptCreateHash");
+			CheckNtStatus(BCryptHashData(
+				hash.Get(), const_cast<PUCHAR>(a_bytes.data()),
+				static_cast<ULONG>(a_bytes.size()), 0),
+				"BCryptHashData");
+			std::array<std::uint8_t, 32> digest{};
+			CheckNtStatus(BCryptFinishHash(
+				hash.Get(), digest.data(), static_cast<ULONG>(digest.size()), 0),
+				"BCryptFinishHash");
+			static constexpr char digits[] = "0123456789abcdef";
+			std::string result;
+			result.reserve(digest.size() * 2);
+			for (const auto byte : digest) {
+				result.push_back(digits[byte >> 4]);
+				result.push_back(digits[byte & 0x0F]);
+			}
+			return result;
+		}
+
 		std::wstring Utf8ToWide(const std::string& a_value)
 		{
 			if (a_value.empty()) {
@@ -282,6 +320,14 @@ namespace CSXCaptureCompanion
 		{
 			return a_value.size() == 64 && std::ranges::all_of(a_value, [](unsigned char a_character) {
 				return std::isxdigit(a_character) != 0;
+			});
+		}
+
+		bool IsLowerHexDigest(std::string_view a_value)
+		{
+			return a_value.size() == 64 && std::ranges::all_of(a_value, [](unsigned char a_character) {
+				return (a_character >= '0' && a_character <= '9') ||
+				       (a_character >= 'a' && a_character <= 'f');
 			});
 		}
 
@@ -490,26 +536,70 @@ namespace CSXCaptureCompanion
 		}
 
 		std::vector<StreamPlan> ReadManifest(
-			const std::filesystem::path& a_manifestOrDirectory,
+			const ManifestArtifact& a_manifestArtifact,
 			std::string_view a_expectedRequestId)
 		{
 			if (a_expectedRequestId.empty())
 				throw std::runtime_error("Video composition requires the completed sequence request identity.");
-			const auto manifestPath = std::filesystem::is_directory(a_manifestOrDirectory) ?
-			                          a_manifestOrDirectory / "sequence.json" :
-			                          a_manifestOrDirectory;
-			const auto sequenceDirectory = manifestPath.parent_path();
-			RejectReparsePoints(std::filesystem::absolute(manifestPath));
-			std::error_code manifestError;
-			const auto manifestBytes = std::filesystem::file_size(manifestPath, manifestError);
-			if (manifestError || manifestBytes > kMaximumManifestBytes)
-				throw std::runtime_error("The completed sequence manifest is unavailable or too large.");
-			std::ifstream stream(manifestPath, std::ios::binary);
-			if (!stream) {
-				throw std::runtime_error("The completed sequence.json could not be opened.");
+			if (a_manifestArtifact.path.empty() || a_manifestArtifact.bytes == 0 ||
+				a_manifestArtifact.bytes > kMaximumManifestBytes ||
+				!IsLowerHexDigest(a_manifestArtifact.sha256)) {
+				throw std::runtime_error("Video composition requires complete manifest artifact custody.");
 			}
-			json manifest;
-			stream >> manifest;
+			const auto manifestPath = std::filesystem::absolute(a_manifestArtifact.path).lexically_normal();
+			const auto sequenceDirectory = manifestPath.parent_path();
+			RejectReparsePoints(manifestPath);
+			const FileHandle custody(CreateFileW(
+				manifestPath.c_str(),
+				GENERIC_READ,
+				FILE_SHARE_READ,
+				nullptr,
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+				nullptr));
+			if (custody.Get() == INVALID_HANDLE_VALUE)
+				throw std::runtime_error("The completed sequence manifest could not be opened under custody.");
+			const auto finalPathLength = GetFinalPathNameByHandleW(
+				custody.Get(), nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (finalPathLength == 0)
+				throw std::runtime_error("The completed sequence manifest path could not be verified.");
+			std::wstring finalPathValue(finalPathLength, L'\0');
+			const auto finalPathWritten = GetFinalPathNameByHandleW(
+				custody.Get(), finalPathValue.data(), finalPathLength,
+				FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (finalPathWritten == 0 || finalPathWritten >= finalPathLength)
+				throw std::runtime_error("The completed sequence manifest path could not be verified.");
+			finalPathValue.resize(finalPathWritten);
+			if (finalPathValue.starts_with(L"\\\\?\\"))
+				finalPathValue.erase(0, 4);
+			if (ComparablePath(finalPathValue) != ComparablePath(manifestPath))
+				throw std::runtime_error("The completed sequence manifest resolved outside its receipt path.");
+			LARGE_INTEGER manifestSize{};
+			if (!GetFileSizeEx(custody.Get(), &manifestSize) || manifestSize.QuadPart < 0 ||
+				static_cast<std::uint64_t>(manifestSize.QuadPart) != a_manifestArtifact.bytes) {
+				throw std::runtime_error("The completed sequence manifest no longer matches its committed size.");
+			}
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+			if (const auto hook = g_manifestCustodyTestHook.load(std::memory_order_acquire))
+				hook(manifestPath);
+#endif
+			std::vector<std::uint8_t> manifestBytes(static_cast<std::size_t>(a_manifestArtifact.bytes));
+			DWORD bytesRead = 0;
+			if (!ReadFile(
+					custody.Get(), manifestBytes.data(), static_cast<DWORD>(manifestBytes.size()),
+					&bytesRead, nullptr) || bytesRead != manifestBytes.size()) {
+				throw std::runtime_error("The completed sequence manifest could not be read under custody.");
+			}
+			DWORD trailingBytes = 0;
+			std::uint8_t trailingByte{};
+			if (!ReadFile(custody.Get(), &trailingByte, 1, &trailingBytes, nullptr) || trailingBytes != 0 ||
+				!GetFileSizeEx(custody.Get(), &manifestSize) || manifestSize.QuadPart < 0 ||
+				static_cast<std::uint64_t>(manifestSize.QuadPart) != a_manifestArtifact.bytes) {
+				throw std::runtime_error("The completed sequence manifest changed while under custody.");
+			}
+			if (HashBytes(manifestBytes) != a_manifestArtifact.sha256)
+				throw std::runtime_error("The completed sequence manifest no longer matches its committed SHA-256.");
+			const auto manifest = json::parse(manifestBytes.begin(), manifestBytes.end());
 			std::vector<StreamPlan> plans;
 			if (manifest.value("schema", "") == "csx.frame-sequence/1") {
 				throw std::runtime_error(
@@ -1029,7 +1119,7 @@ namespace CSXCaptureCompanion
 	}
 
 	bool VideoComposer::Queue(
-		const std::filesystem::path& a_sequenceDirectory,
+		ManifestArtifact a_manifest,
 		std::string a_expectedRequestId)
 	{
 		std::lock_guard workerLock(workerMutex);
@@ -1043,10 +1133,10 @@ namespace CSXCaptureCompanion
 			ShowNotification("Video composition queued");
 			worker = std::jthread([
 				this,
-				sequenceDirectory = a_sequenceDirectory,
+				manifest = std::move(a_manifest),
 				expectedRequestId = std::move(a_expectedRequestId)] {
 				try {
-					Run(sequenceDirectory, expectedRequestId);
+					Run(std::move(manifest), expectedRequestId);
 				} catch (const std::exception& exception) {
 					SetStatus(ComposeState::kFailed, std::string("Video worker failed unexpectedly: ") + exception.what());
 					SKSE::log::error("{}", GetStatusText());
@@ -1083,12 +1173,11 @@ namespace CSXCaptureCompanion
 	}
 
 	void VideoComposer::Run(
-		std::filesystem::path a_sequenceDirectory,
+		ManifestArtifact a_manifest,
 		std::string a_expectedRequestId)
 	{
 		try {
-			if (!std::filesystem::is_directory(a_sequenceDirectory))
-				a_sequenceDirectory = a_sequenceDirectory.parent_path();
+			const auto sequenceDirectory = a_manifest.path.parent_path();
 			SetStatus(ComposeState::kEncoding, "Encoding the latest completed capture.");
 			ComRuntime com;
 			MediaFoundationRuntime mediaFoundation;
@@ -1100,8 +1189,8 @@ namespace CSXCaptureCompanion
 				IID_PPV_ARGS(factory.GetAddressOf())),
 				"CoCreateInstance(WICImagingFactory)");
 
-			const auto plans = ReadManifest(a_sequenceDirectory, a_expectedRequestId);
-			const auto encodings = BuildEncodingPlans(a_sequenceDirectory, plans);
+			const auto plans = ReadManifest(a_manifest, a_expectedRequestId);
+			const auto encodings = BuildEncodingPlans(sequenceDirectory, plans);
 			const bool anyOutputExists = std::ranges::any_of(encodings, [](const EncodingPlan& a_encoding) {
 				return std::filesystem::exists(a_encoding.output);
 			});

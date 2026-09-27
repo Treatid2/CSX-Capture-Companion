@@ -11,10 +11,33 @@ namespace
 {
 	using CSXCaptureCompanion::CaptureSession;
 	using json = nlohmann::json;
+	constexpr std::string_view kManifestDigest =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 	json StartRequest()
 	{
 		return { { "action", "sequence_start" }, { "sequence", json::object() } };
+	}
+
+	json TerminalReceipt(
+		std::string a_requestId,
+		std::string a_state,
+		std::string a_manifestPath)
+	{
+		return {
+			{ "ok", true },
+			{ "result", {
+				{ "requestId", std::move(a_requestId) },
+				{ "state", std::move(a_state) },
+				{ "manifest", { { "finalPath", a_manifestPath } } },
+				{ "artifacts", json::array({ {
+					{ "path", std::move(a_manifestPath) },
+					{ "bytes", 123u },
+					{ "committed", true },
+					{ "sha256", kManifestDigest },
+				} }) },
+			} },
+		};
 	}
 
 	bool Check(bool a_condition, std::string_view a_message)
@@ -35,6 +58,10 @@ namespace
 			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "" } } } },
 			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "future_state" } } } },
 			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", json::object() } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } }, { "artifacts", json::array({ { { "path", "D:/captures/B/sequence.json" }, { "bytes", 123u }, { "committed", true }, { "sha256", kManifestDigest } } }) } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } }, { "artifacts", json::array({ { { "path", "D:/captures/A/sequence.json" }, { "bytes", 0u }, { "committed", true }, { "sha256", kManifestDigest } } }) } } } },
+			{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "completed" }, { "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } }, { "artifacts", json::array({ { { "path", "D:/captures/A/sequence.json" }, { "bytes", 123u }, { "committed", true }, { "sha256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } } }) } } } },
 		};
 
 		bool passed = true;
@@ -66,14 +93,7 @@ namespace
 			}
 			if (action == "request_get") {
 				if (request.at("requestId") == "seed") {
-					return json{
-						{ "ok", true },
-						{ "result", {
-							{ "requestId", "seed" },
-							{ "state", "completed" },
-							{ "manifest", { { "finalPath", "D:/captures/seed/sequence.json" } } },
-						} },
-					};
+					return TerminalReceipt("seed", "completed", "D:/captures/seed/sequence.json");
 				}
 				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "running" } } } };
 			}
@@ -170,14 +190,7 @@ namespace
 				refreshEntered = true;
 				replyCondition.notify_all();
 				replyCondition.wait(lock, [&] { return releaseRefresh; });
-				return json{
-					{ "ok", true },
-					{ "result", {
-						{ "requestId", "A" },
-						{ "state", "completed" },
-						{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
-					} },
-				};
+				return TerminalReceipt("A", "completed", "D:/captures/A/sequence.json");
 			}
 			return json{ { "ok", false } };
 		});
@@ -214,14 +227,7 @@ namespace
 				return json{ { "ok", true }, { "result", { { "requestId", "A" } } } };
 			}
 			if (action == "request_get") {
-				return json{
-					{ "ok", true },
-					{ "result", {
-						{ "requestId", "A" },
-						{ "state", "stopped" },
-						{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
-					} },
-				};
+				return TerminalReceipt("A", "stopped", "D:/captures/A/sequence.json");
 			}
 			return json{ { "ok", false } };
 		});
@@ -233,7 +239,10 @@ namespace
 		       Check(session.LatestManifest() == std::filesystem::path("D:/captures/A/sequence.json"),
 			       "The acknowledged terminal capture did not retain its manifest.") &&
 		       Check(session.LatestManifestRequestId() == "A",
-			       "The acknowledged terminal capture did not retain its request identity.");
+			       "The acknowledged terminal capture did not retain its request identity.") &&
+		       Check(session.LatestCompletedCapture().manifest.bytes == 123u &&
+			       session.LatestCompletedCapture().manifest.sha256 == kManifestDigest,
+			       "The acknowledged terminal capture did not retain receipt artifact custody.");
 	}
 
 	bool TestPermanentRefreshClassification()

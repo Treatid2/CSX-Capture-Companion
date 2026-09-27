@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <utility>
 
 namespace CSXCaptureCompanion
@@ -13,7 +14,7 @@ namespace CSXCaptureCompanion
 		ReceiptFailure TryDecodeReceipt(const json& a_response,
 			std::string_view a_expectedRequestId,
 			std::string& a_state,
-			std::filesystem::path& a_manifest,
+			ManifestArtifact& a_manifest,
 			bool& a_hasManifest) noexcept
 		{
 			try {
@@ -41,6 +42,7 @@ namespace CSXCaptureCompanion
 				if (CaptureStateCode(a_state) < 0)
 					return ReceiptFailure::kInvalid;
 				a_hasManifest = false;
+				a_manifest = {};
 				if (receipt.contains("manifest")) {
 					const auto& manifest = receipt["manifest"];
 					if (!manifest.is_object() || !manifest.contains("finalPath")) {
@@ -51,7 +53,33 @@ namespace CSXCaptureCompanion
 							manifest["finalPath"].get_ref<const std::string&>();
 						if (finalPath.empty())
 							return ReceiptFailure::kInvalid;
-						a_manifest = std::filesystem::u8path(finalPath);
+						if (!receipt.contains("artifacts") || !receipt["artifacts"].is_array() ||
+							receipt["artifacts"].size() != 1) {
+							return ReceiptFailure::kInvalid;
+						}
+						const auto& artifact = receipt["artifacts"].front();
+						if (!artifact.is_object() || !artifact.contains("path") ||
+							!artifact["path"].is_string() ||
+							artifact["path"].get_ref<const std::string&>() != finalPath ||
+							!artifact.contains("committed") || !artifact["committed"].is_boolean() ||
+							!artifact["committed"].get<bool>() || !artifact.contains("bytes") ||
+							!artifact["bytes"].is_number_unsigned() ||
+							artifact["bytes"].get<std::uint64_t>() == 0 ||
+							!artifact.contains("sha256") || !artifact["sha256"].is_string()) {
+							return ReceiptFailure::kInvalid;
+						}
+						const auto& digest = artifact["sha256"].get_ref<const std::string&>();
+						if (digest.size() != 64 || !std::ranges::all_of(digest, [](unsigned char a_character) {
+								return (a_character >= '0' && a_character <= '9') ||
+								       (a_character >= 'a' && a_character <= 'f');
+							})) {
+							return ReceiptFailure::kInvalid;
+						}
+						a_manifest = {
+							.path = std::filesystem::u8path(finalPath),
+							.bytes = artifact["bytes"].get<std::uint64_t>(),
+							.sha256 = digest,
+						};
 						a_hasManifest = true;
 					} else if (!manifest["finalPath"].is_null()) {
 						return ReceiptFailure::kInvalid;
@@ -134,7 +162,7 @@ namespace CSXCaptureCompanion
 		const auto response =
 			dispatch({ { "action", "request_get" }, { "requestId", requestId } });
 		std::string state;
-		std::filesystem::path manifest;
+		ManifestArtifact manifest;
 		bool hasManifest = false;
 		update.failure =
 			TryDecodeReceipt(response, requestId, state, manifest, hasManifest);
@@ -153,8 +181,7 @@ namespace CSXCaptureCompanion
 			return { .state = lastState };
 		if (update.terminal) {
 			if (hasManifest) {
-				latestManifest = std::move(manifest);
-				latestManifestRequestId = requestId;
+				latestCapture = { std::move(manifest), requestId };
 			}
 			activeRequestId.clear();
 		}
@@ -189,7 +216,7 @@ namespace CSXCaptureCompanion
 			const auto response =
 				dispatch({ { "action", "sequence_stop" }, { "requestId", requestId } });
 			std::string state;
-			std::filesystem::path manifest;
+			ManifestArtifact manifest;
 			bool hasManifest = false;
 			CaptureUpdate update{ .requestId = requestId };
 			update.failure =
@@ -208,8 +235,7 @@ namespace CSXCaptureCompanion
 				return {};
 			if (update.terminal) {
 				if (hasManifest) {
-					latestManifest = std::move(manifest);
-					latestManifestRequestId = requestId;
+					latestCapture = { std::move(manifest), requestId };
 				}
 				activeRequestId.clear();
 			}
@@ -227,8 +253,7 @@ namespace CSXCaptureCompanion
 		std::lock_guard stateLock(stateMutex);
 		activeRequestId = std::move(requestId);
 		// A newer accepted attempt supersedes automatic composition eligibility.
-		latestManifest.clear();
-		latestManifestRequestId.clear();
+		latestCapture = {};
 		lastState = 1;
 		return { .requestId = activeRequestId, .state = 1, .accepted = true };
 	}
@@ -239,8 +264,7 @@ namespace CSXCaptureCompanion
 		std::lock_guard stateLock(stateMutex);
 		auto abandoned = std::move(activeRequestId);
 		activeRequestId.clear();
-		latestManifest.clear();
-		latestManifestRequestId.clear();
+		latestCapture = {};
 		lastState = 0;
 		return abandoned;
 	}
@@ -260,19 +284,19 @@ namespace CSXCaptureCompanion
 	std::filesystem::path CaptureSession::LatestManifest() const
 	{
 		std::lock_guard stateLock(stateMutex);
-		return latestManifest;
+		return latestCapture.manifest.path;
 	}
 
 	std::string CaptureSession::LatestManifestRequestId() const
 	{
 		std::lock_guard stateLock(stateMutex);
-		return latestManifestRequestId;
+		return latestCapture.requestId;
 	}
 
 	CompletedCapture CaptureSession::LatestCompletedCapture() const
 	{
 		std::lock_guard stateLock(stateMutex);
-		return { latestManifest, latestManifestRequestId };
+		return latestCapture;
 	}
 
 	std::string CaptureSession::ActiveRequestId() const

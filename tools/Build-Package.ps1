@@ -3,7 +3,7 @@ param(
     [string] $BuildDirectory = 'build',
     [string[]] $PapyrusImportPath = @(),
     [string] $CommonLibSseSource = 'L:\Codex\projects\CSX-Capture-API\extern\CommonLibSSE-NG',
-    [string] $CommonLibSsePrebuilt = 'L:\Codex\shared\cache\commonlibsse-ng\v6.7.0\all-msvc-cmake',
+    [string] $CommonLibSsePrebuilt,
     [string] $VcpkgToolchain = 'L:\Codex\shared\tools\vcpkg\scripts\buildsystems\vcpkg.cmake',
     [string] $VcpkgInstalledDirectory = 'L:\Codex\projects\CSX-Capture-API\build\ALL-Prebuilt\vcpkg_installed'
 )
@@ -11,6 +11,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$dependencyMetadata = Import-PowerShellDataFile -LiteralPath (Join-Path $PSScriptRoot 'DependencyVersions.psd1')
+if (-not $CommonLibSsePrebuilt) {
+    $CommonLibSsePrebuilt = $dependencyMetadata.CommonLibSseNg.PrebuiltDirectory
+}
+& (Join-Path $PSScriptRoot 'Test-DependencyProvenance.ps1') `
+    -CommonLibSsePrebuilt $CommonLibSsePrebuilt | Out-Null
 $buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDirectory)) {
     [System.IO.Path]::GetFullPath($BuildDirectory)
 } else {
@@ -55,7 +61,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Native build failed with exit code $LASTEXITCODE."
 }
 & ctest --test-dir $buildRoot -C Release --output-on-failure `
-    -R '^(composer-smoke|capture-session|capture-controller)$'
+    -R '^(composer-smoke|capture-session|capture-controller|package-provenance)$'
 if ($LASTEXITCODE -ne 0) {
     throw "Native tests failed with exit code $LASTEXITCODE."
 }

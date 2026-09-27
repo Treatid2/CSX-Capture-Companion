@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ManifestArtifact.h"
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -12,6 +14,11 @@ namespace CSXCaptureCompanion
 	using NotificationCallback = void (*)(std::string);
 	void SetNotificationCallback(NotificationCallback a_callback) noexcept;
 	void ShowNotification(std::string a_message);
+
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+	using ManifestCustodyTestHook = void (*)(const std::filesystem::path&);
+	void SetManifestCustodyTestHook(ManifestCustodyTestHook a_hook) noexcept;
+#endif
 
 	enum class ComposeState : std::int32_t
 	{
@@ -33,14 +40,14 @@ namespace CSXCaptureCompanion
 		VideoComposer& operator=(VideoComposer&&) = delete;
 
 		bool Queue(
-			const std::filesystem::path& a_sequenceDirectory,
+			ManifestArtifact a_manifest,
 			std::string a_expectedRequestId);
 		[[nodiscard]] ComposeState GetState() const noexcept;
 		[[nodiscard]] std::string GetStatusText() const;
 
 	private:
 		void Run(
-			std::filesystem::path a_sequenceDirectory,
+			ManifestArtifact a_manifest,
 			std::string a_expectedRequestId);
 		void SetStatus(ComposeState a_state, std::string a_text);
 

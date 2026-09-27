@@ -184,7 +184,7 @@ namespace CSXCaptureCompanion
 				notify("Composition queued until capture finishes");
 				PollCapture();
 			} else if (const auto completed = session.LatestCompletedCapture();
-				!completed.manifest.empty() && !completed.requestId.empty()) {
+				!completed.manifest.Empty() && !completed.requestId.empty()) {
 				pendingComposeRequestId.clear();
 				if (!compose(completed.manifest, completed.requestId))
 					SKSE::log::warn("Video composition request was not accepted");

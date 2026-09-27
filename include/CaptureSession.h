@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ManifestArtifact.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -23,7 +25,7 @@ namespace CSXCaptureCompanion
 	struct CaptureUpdate
 	{
 		std::string requestId;
-		std::filesystem::path manifest;
+		ManifestArtifact manifest;
 		std::int32_t state{ -1 };
 		ReceiptFailure failure{ ReceiptFailure::kNone };
 		bool accepted{ false };
@@ -33,7 +35,7 @@ namespace CSXCaptureCompanion
 
 	struct CompletedCapture
 	{
-		std::filesystem::path manifest;
+		ManifestArtifact manifest;
 		std::string requestId;
 	};
 
@@ -72,8 +74,7 @@ namespace CSXCaptureCompanion
 		mutable std::mutex operationMutex;
 		mutable std::mutex stateMutex;
 		std::string activeRequestId;
-		std::filesystem::path latestManifest;
-		std::string latestManifestRequestId;
+		CompletedCapture latestCapture;
 		std::int32_t lastState{ 0 };
 	};
 }

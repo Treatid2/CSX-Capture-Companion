@@ -140,12 +140,23 @@ function Write-TestManifest {
 	$document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Sequence 'sequence.json') -Encoding utf8NoBOM
 }
 
+function Get-ManifestCustody {
+	param([Parameter(Mandatory)] [string] $Sequence)
+	$manifest = Get-Item -LiteralPath (Join-Path $Sequence 'sequence.json')
+	return [pscustomobject]@{
+		Path = $manifest.FullName
+		Bytes = [string][uint64]$manifest.Length
+		Sha256 = (Get-FileHash -LiteralPath $manifest.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+	}
+}
+
 function Invoke-ExpectedFailure {
 	param(
 		[Parameter(Mandatory)] [string] $Sequence,
 		[string] $RequestId = 'fixture-sequence'
 	)
-	& $Executable --expect-failure $RequestId $Sequence
+	$custody = Get-ManifestCustody -Sequence $Sequence
+	& $Executable --expect-failure $RequestId $custody.Path $custody.Bytes $custody.Sha256
 	if ($LASTEXITCODE -ne 0) {
 		throw "Composer did not safely reject fixture $Sequence (exit $LASTEXITCODE)."
 	}
@@ -185,7 +196,8 @@ function Invoke-CompositionWithSampleCount {
 		[Parameter(Mandatory)] [int] $ExpectedCount,
 		[string] $RequestId = 'fixture-sequence'
 	)
-	& $Executable $RequestId $Sequence
+	$custody = Get-ManifestCustody -Sequence $Sequence
+	& $Executable $RequestId $custody.Path $custody.Bytes $custody.Sha256
 	if ($LASTEXITCODE -ne 0) {
 		throw "Composer rejected valid fixture $Sequence (exit $LASTEXITCODE)."
 	}
@@ -331,7 +343,8 @@ $oldPredictableTemporary = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_1-sbs.
 Set-Content -LiteralPath $oldPredictableTemporary -Value 'unrelated pre-existing file' -Encoding ascii -NoNewline
 $oldTemporaryHash = (Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash
 
-& $Executable 'smoke-sequence' $sequence
+$custody = Get-ManifestCustody -Sequence $sequence
+& $Executable 'smoke-sequence' $custody.Path $custody.Bytes $custody.Sha256
 if ($LASTEXITCODE -ne 0) {
     throw "Composer smoke executable failed with exit code $LASTEXITCODE."
 }
@@ -387,7 +400,8 @@ if ((Get-FileHash -LiteralPath $oldPredictableTemporary -Algorithm SHA256).Hash 
 
 $raceSequence = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race'
 Copy-Item -LiteralPath $sequence -Destination $raceSequence -Recurse
-& $Executable --race 'smoke-sequence' $raceSequence
+$raceCustody = Get-ManifestCustody -Sequence $raceSequence
+& $Executable --race 'smoke-sequence' $raceCustody.Path $raceCustody.Bytes $raceCustody.Sha256
 if ($LASTEXITCODE -ne 0) {
 	throw "Concurrent composer admission test failed with exit code $LASTEXITCODE."
 }
@@ -395,7 +409,8 @@ $numberedOutput = Join-Path $resolvedWorkRoot 'CS_sequence_smoke_race-sbs-2.mp4'
 if (Test-Path -LiteralPath $numberedOutput -PathType Leaf) {
 	throw 'Idempotent composition unexpectedly created a numbered duplicate output.'
 }
-& $Executable 'smoke-sequence' $sequence
+$custody = Get-ManifestCustody -Sequence $sequence
+& $Executable 'smoke-sequence' $custody.Path $custody.Bytes $custody.Sha256
 if ($LASTEXITCODE -eq 0) {
 	throw 'Repeat composition trusted an existing deterministic output without provenance.'
 }
@@ -406,6 +421,56 @@ if (Test-Path -LiteralPath $repeatOutput -PathType Leaf) {
 
 $leftSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $leftFrames } | Select-Object -First 1
 $rightSource = $sourceFiles | Where-Object { $_.DirectoryName -eq $rightFrames } | Select-Object -First 1
+
+$manifestSubstitutionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_manifest_substitution'
+Write-TestManifest -Sequence $manifestSubstitutionSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$originalManifestCustody = Get-ManifestCustody -Sequence $manifestSubstitutionSequence
+$substitutedManifest = (Get-Content -LiteralPath $originalManifestCustody.Path -Raw).Replace(
+	'composer-smoke-fixture', 'composer-smoke-changed')
+[System.IO.File]::WriteAllText(
+	$originalManifestCustody.Path,
+	$substitutedManifest,
+	[System.Text.UTF8Encoding]::new($false))
+if ((Get-Item -LiteralPath $originalManifestCustody.Path).Length -ne [uint64]$originalManifestCustody.Bytes) {
+	throw 'Manifest substitution fixture did not preserve byte length.'
+}
+& $Executable --expect-failure 'fixture-sequence' $originalManifestCustody.Path `
+	$originalManifestCustody.Bytes $originalManifestCustody.Sha256
+if ($LASTEXITCODE -ne 0) {
+	throw 'Composer did not reject a substituted valid manifest against receipt custody.'
+}
+if (Test-Path -LiteralPath (Join-Path $resolvedWorkRoot 'CS_sequence_manifest_substitution-left.mp4')) {
+	throw 'A substituted manifest created a video output.'
+}
+
+$manifestMismatchSequence = Join-Path $resolvedWorkRoot 'CS_sequence_manifest_mismatch'
+Write-TestManifest -Sequence $manifestMismatchSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$manifestMismatchCustody = Get-ManifestCustody -Sequence $manifestMismatchSequence
+& $Executable --expect-failure 'fixture-sequence' $manifestMismatchCustody.Path `
+	([string]([uint64]$manifestMismatchCustody.Bytes + 1)) $manifestMismatchCustody.Sha256
+if ($LASTEXITCODE -ne 0) {
+	throw 'Composer did not reject a receipt manifest size mismatch.'
+}
+& $Executable --expect-failure 'fixture-sequence' $manifestMismatchCustody.Path `
+	$manifestMismatchCustody.Bytes ('0' * 64)
+if ($LASTEXITCODE -ne 0) {
+	throw 'Composer did not reject a receipt manifest digest mismatch.'
+}
+
+$manifestLockSequence = Join-Path $resolvedWorkRoot 'CS_sequence_manifest_lock'
+Write-TestManifest -Sequence $manifestLockSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$manifestLockCustody = Get-ManifestCustody -Sequence $manifestLockSequence
+& $Executable --verify-manifest-lock 'fixture-sequence' $manifestLockCustody.Path `
+	$manifestLockCustody.Bytes $manifestLockCustody.Sha256
+if ($LASTEXITCODE -ne 0) {
+	throw 'Manifest custody did not deny replacement while composition verified its bytes.'
+}
+if (Test-Path -LiteralPath ($manifestLockCustody.Path + '.moved')) {
+	throw 'Manifest custody test unexpectedly moved the manifest.'
+}
 
 $collisionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision'
 Write-TestManifest -Sequence $collisionSequence -Suffixes @('left') `

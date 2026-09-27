@@ -16,7 +16,7 @@
 namespace CSXCaptureCompanion
 {
 	using ComposeRequest =
-		std::function<bool(const std::filesystem::path&, std::string)>;
+		std::function<bool(const ManifestArtifact&, std::string)>;
 	using CaptureNotification = std::function<void(std::string)>;
 
 	class CaptureController final

@@ -17,12 +17,36 @@
 namespace
 {
 	using CSXCaptureCompanion::CaptureController;
+	using CSXCaptureCompanion::ManifestArtifact;
 	using json = nlohmann::json;
 	using namespace std::chrono_literals;
+	constexpr std::string_view kManifestDigest =
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 	json StartRequest()
 	{
 		return { { "action", "sequence_start" }, { "sequence", json::object() } };
+	}
+
+	json TerminalReceipt(
+		std::string a_requestId,
+		std::string a_state,
+		std::string a_manifestPath)
+	{
+		return {
+			{ "ok", true },
+			{ "result", {
+				{ "requestId", std::move(a_requestId) },
+				{ "state", std::move(a_state) },
+				{ "manifest", { { "finalPath", a_manifestPath } } },
+				{ "artifacts", json::array({ {
+					{ "path", std::move(a_manifestPath) },
+					{ "bytes", 123u },
+					{ "committed", true },
+					{ "sha256", kManifestDigest },
+				} }) },
+			} },
+		};
 	}
 
 	bool Check(bool a_condition, std::string_view a_message)
@@ -55,7 +79,7 @@ namespace
 					std::this_thread::sleep_for(5ms);
 				return json{ { "ok", true }, { "result", { { "requestId", "still-A" } } } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[](std::string) {});
 
 		const auto started = std::chrono::steady_clock::now();
@@ -80,7 +104,7 @@ namespace
 					std::this_thread::sleep_for(5ms);
 				return json{ { "ok", true }, { "result", { { "requestId", "blocked" } } } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "Capture command rejected - companion queue is full")
 					++saturationNotices;
@@ -116,10 +140,8 @@ namespace
 					if (request.at("action") == "sequence_start")
 						return json{ { "ok", true }, { "result", { { "requestId", "shutdown" } } } };
 					if (request.at("action") == "request_get") {
-						return json{ { "ok", true }, { "result", {
-							{ "requestId", "shutdown" }, { "state", "completed" },
-							{ "manifest", { { "finalPath", "D:/missing/shutdown/sequence.json" } } },
-						} } };
+						return TerminalReceipt(
+							"shutdown", "completed", "D:/missing/shutdown/sequence.json");
 					}
 					return json{ { "ok", false } };
 				},
@@ -158,7 +180,7 @@ namespace
 				}
 				return json{ { "ok", false } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -204,19 +226,13 @@ namespace
 				if (action == "request_get" && stopRequested.load()) {
 					if (transientRefreshes++ == 0)
 						return json{ { "ok", false }, { "error", { { "code", "transport_error" } } } };
-					return json{
-						{ "ok", true },
-						{ "result", {
-							{ "requestId", "A" }, { "state", "stopped" },
-							{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
-						} },
-					};
+					return TerminalReceipt("A", "stopped", "D:/captures/A/sequence.json");
 				}
 				return json{ { "ok", true }, { "result", { { "requestId", "A" }, { "state", "running" } } } };
 			},
-			[&](const std::filesystem::path& a_manifest, std::string a_requestId) {
+			[&](const ManifestArtifact& a_manifest, std::string a_requestId) {
 				std::lock_guard lock(composedMutex);
-				composed = a_manifest;
+				composed = a_manifest.path;
 				composedRequestId = std::move(a_requestId);
 				return true;
 			},
@@ -259,22 +275,14 @@ namespace
 						{ "result", { { "requestId", "race" }, { "state", "running" } } }
 					};
 				if (action == "request_get") {
-					return json{
-						{ "ok", true },
-						{ "result",
-							{
-								{ "requestId", "race" },
-								{ "state", "stopped" },
-								{ "manifest",
-									{ { "finalPath", "D:/captures/race/sequence.json" } } },
-							} },
-					};
+					return TerminalReceipt(
+						"race", "stopped", "D:/captures/race/sequence.json");
 				}
 				return json{ { "ok", false } };
 			},
-			[&](const std::filesystem::path& manifest, std::string requestId) {
+			[&](const ManifestArtifact& manifest, std::string requestId) {
 				std::lock_guard lock(composedMutex);
-				composed.push_back(manifest);
+				composed.push_back(manifest.path);
 				composedRequestIds.push_back(std::move(requestId));
 				return true;
 			},
@@ -323,24 +331,16 @@ namespace
 						{ "result", { { "requestId", current == 1 ? "A" : "B" } } } };
 				}
 				if (action == "request_get" && request.at("requestId") == "A") {
-					return json{
-						{ "ok", true },
-						{ "result",
-							{
-								{ "requestId", "A" },
-								{ "state", "completed" },
-								{ "manifest", { { "finalPath", "D:/captures/A/sequence.json" } } },
-							} },
-					};
+					return TerminalReceipt("A", "completed", "D:/captures/A/sequence.json");
 				}
 				if (action == "request_get")
 					return json{ { "ok", true },
 						{ "result", { { "requestId", "B" }, { "state", "failed" } } } };
 				return json{ { "ok", false } };
 			},
-			[&](const std::filesystem::path& manifest, std::string) {
+			[&](const ManifestArtifact& manifest, std::string) {
 				std::lock_guard lock(resultMutex);
-				composed.push_back(manifest);
+				composed.push_back(manifest.path);
 				return true;
 			},
 			[&](std::string message) {
@@ -391,7 +391,7 @@ namespace
 				++receiptPolls;
 				return json{ { "ok", false }, { "error", { { "code", "request_not_found" } } } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -451,24 +451,15 @@ namespace
 							} },
 					};
 				}
-				if (stopRequested.load()) {
-					return json{
-						{ "ok", true },
-						{ "result",
-							{
-								{ "requestId", "transient" },
-								{ "state", "stopped" },
-								{ "manifest",
-									{ { "finalPath", "D:/captures/transient/sequence.json" } } },
-							} },
-					};
-				}
+				if (stopRequested.load())
+					return TerminalReceipt(
+						"transient", "stopped", "D:/captures/transient/sequence.json");
 				return json{
 					{ "ok", true },
 					{ "result", { { "requestId", "transient" }, { "state", "running" } } }
 				};
 			},
-			[](const std::filesystem::path&, std::string) { return true; }, [](std::string) {});
+			[](const ManifestArtifact&, std::string) { return true; }, [](std::string) {});
 
 		if (!Check(controller.QueueToggle(StartRequest()),
 				"The transient capture did not queue.") ||
@@ -503,7 +494,7 @@ namespace
 				}
 				return json{ { "ok", false } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "No completed capture is ready")
 					std::this_thread::sleep_for(5ms);
@@ -562,7 +553,7 @@ namespace
 						{ { "requestId", request.at("requestId") }, { "state", "encoding" } } },
 				};
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				std::lock_guard lock(notificationMutex);
 				notifications.push_back(std::move(message));
@@ -615,14 +606,12 @@ namespace
 					}
 					return json{ { "ok", true }, { "result", { { "requestId", id }, { "state", "running" } } } };
 				}
-				return json{ { "ok", true }, { "result", {
-					{ "requestId", id }, { "state", "completed" },
-					{ "manifest", { { "finalPath", std::format("D:/captures/{}/sequence.json", id) } } },
-				} } };
+				return TerminalReceipt(
+					id, "completed", std::format("D:/captures/{}/sequence.json", id));
 			},
-			[&](const std::filesystem::path& manifest, std::string) {
+			[&](const ManifestArtifact& manifest, std::string) {
 				std::lock_guard lock(resultMutex);
-				composed.push_back(manifest);
+				composed.push_back(manifest.path);
 				return true;
 			},
 			[&](std::string message) {
@@ -689,12 +678,15 @@ namespace
 				}
 				if (action == "sequence_stop")
 					stopped = true;
+				if (stopped)
+					return TerminalReceipt(
+						"owned", "stopped", "D:/captures/owned/sequence.json");
 				return json{ { "ok", true }, { "result", {
-					{ "requestId", "owned" }, { "state", stopped ? "stopped" : "running" },
-					{ "manifest", { { "finalPath", stopped ? json("D:/captures/owned/sequence.json") : json(nullptr) } } },
+					{ "requestId", "owned" }, { "state", "running" },
+					{ "manifest", { { "finalPath", nullptr } } },
 				} } };
 			},
-			[&](const std::filesystem::path&, std::string) { ++composed; return true; },
+			[&](const ManifestArtifact&, std::string) { ++composed; return true; },
 			[&](std::string message) {
 				std::lock_guard lock(resultMutex);
 				notifications.push_back(std::move(message));
@@ -744,7 +736,7 @@ namespace
 				return json{ { "ok", true }, { "result", { { "requestId", id },
 					{ "state", id == "still-17" ? "completed" : polls % 2 ? "unknown" : "" } } } };
 			},
-			[](const std::filesystem::path&, std::string) { return true; },
+			[](const ManifestArtifact&, std::string) { return true; },
 			[&](std::string message) {
 				if (message == "Screenshot status unavailable - see CSXCaptureCompanion.log")
 					++unavailable;

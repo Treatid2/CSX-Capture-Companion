@@ -93,7 +93,13 @@ if(BUILD_TESTING)
     )
     target_compile_features(CSXCaptureComposerSmoke PRIVATE cxx_std_23)
     target_include_directories(CSXCaptureComposerSmoke PRIVATE include)
-    target_compile_definitions(CSXCaptureComposerSmoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(
+        CSXCaptureComposerSmoke
+        PRIVATE
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            CSX_CAPTURE_COMPOSER_TESTING
+    )
     target_precompile_headers(CSXCaptureComposerSmoke PRIVATE include/PCH.h)
     target_link_libraries(
         CSXCaptureComposerSmoke
@@ -160,4 +166,9 @@ if(BUILD_TESTING)
 		target_compile_options(CSXCaptureControllerTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
 	endif()
 	add_test(NAME capture-controller COMMAND CSXCaptureControllerTests)
+	add_test(
+		NAME package-provenance
+		COMMAND
+			pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/Test-DependencyProvenance.ps1"
+	)
 endif()

@@ -1,16 +1,16 @@
 # Third-party notices
 
 CSX Capture Companion is distributed under GPL-3.0-only. Its Windows DLL is
-built against CommonLibSSE-NG 6.3.3 and the dependency set described below.
+built against CommonLibSSE-NG 6.7.0 and the dependency set described below.
 The corresponding licence texts are reproduced in the adjacent `licenses`
 directory. Those third-party components remain subject to their own notices
 and additional permissions.
 
 ## Incorporated or linked components
 
-### CommonLibSSE-NG 6.3.3
+### CommonLibSSE-NG 6.7.0
 
-Source: <https://github.com/alandtse/CommonLibSSE-NG/tree/v6.3.3>
+Source: <https://github.com/alandtse/CommonLibSSE-NG/tree/v6.7.0>
 
 Licence: GPL-3.0-or-later with the CommonLibSSE-NG Modding Exception and
 GPL-3.0 Linking Exception (with Corresponding Source). The binary contains

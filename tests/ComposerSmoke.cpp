@@ -22,6 +22,24 @@
 namespace
 {
 	using Microsoft::WRL::ComPtr;
+	using CSXCaptureCompanion::ManifestArtifact;
+
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+	std::atomic_bool g_manifestRenameBlocked{ false };
+	std::atomic_bool g_manifestRenameAttempted{ false };
+
+	void AttemptManifestRename(const std::filesystem::path& a_manifest)
+	{
+		g_manifestRenameAttempted = true;
+		auto moved = a_manifest;
+		moved += L".moved";
+		if (!MoveFileExW(a_manifest.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH)) {
+			const auto error = GetLastError();
+			g_manifestRenameBlocked =
+				error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED;
+		}
+	}
+#endif
 
 	CSXCaptureCompanion::VideoComposer& Composer()
 	{
@@ -136,19 +154,38 @@ namespace
 	}
 
 	int RunComposition(
-		const std::filesystem::path& a_sequence,
+		ManifestArtifact a_manifest,
 		std::string a_requestId,
-		bool a_expectFailure)
+		bool a_expectFailure,
+		bool a_verifyManifestLock = false)
 	{
 		auto& composer = Composer();
-		if (!composer.Queue(a_sequence, std::move(a_requestId))) {
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+		if (a_verifyManifestLock) {
+			g_manifestRenameAttempted = false;
+			g_manifestRenameBlocked = false;
+			CSXCaptureCompanion::SetManifestCustodyTestHook(&AttemptManifestRename);
+		}
+#else
+		(void)a_verifyManifestLock;
+#endif
+		if (!composer.Queue(std::move(a_manifest), std::move(a_requestId))) {
 			std::cerr << "Composer rejected the smoke-test sequence before starting its worker.\n";
 			return 3;
 		}
-		return WaitForComposition(a_expectFailure);
+		const auto result = WaitForComposition(a_expectFailure);
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+		CSXCaptureCompanion::SetManifestCustodyTestHook(nullptr);
+		if (a_verifyManifestLock &&
+			(!g_manifestRenameAttempted.load() || !g_manifestRenameBlocked.load())) {
+			std::cerr << "Manifest replacement was not denied while the custody handle was held.\n";
+			return 11;
+		}
+#endif
+		return result;
 	}
 
-	int RaceComposition(const std::filesystem::path& a_sequence, const std::string& a_requestId)
+	int RaceComposition(const ManifestArtifact& a_manifest, const std::string& a_requestId)
 	{
 		auto& composer = Composer();
 		constexpr std::size_t contenderCount = 8;
@@ -159,7 +196,7 @@ namespace
 		for (std::size_t index = 0; index < contenderCount; ++index) {
 			contenders.emplace_back([&] {
 				gate.arrive_and_wait();
-				if (composer.Queue(a_sequence, a_requestId))
+				if (composer.Queue(a_manifest, a_requestId))
 					accepted.fetch_add(1, std::memory_order_relaxed);
 			});
 		}
@@ -409,7 +446,7 @@ namespace
 
 int wmain(int a_argumentCount, wchar_t** a_arguments)
 {
-	auto requestId = [](const wchar_t* a_value) {
+	auto narrowAscii = [](const wchar_t* a_value) {
 		std::wstring_view wide(a_value);
 		if (!std::ranges::all_of(wide, [](wchar_t a_character) { return a_character >= 0 && a_character <= 0x7F; }))
 			return std::string{};
@@ -419,10 +456,29 @@ int wmain(int a_argumentCount, wchar_t** a_arguments)
 			result.push_back(static_cast<char>(character));
 		return result;
 	};
-	if (a_argumentCount == 4 && std::wstring_view(a_arguments[1]) == L"--expect-failure")
-		return RunComposition(a_arguments[3], requestId(a_arguments[2]), true);
-	if (a_argumentCount == 4 && std::wstring_view(a_arguments[1]) == L"--race")
-		return RaceComposition(a_arguments[3], requestId(a_arguments[2]));
+	auto manifestArtifact = [&](const wchar_t* a_path, const wchar_t* a_bytes, const wchar_t* a_sha256) {
+		wchar_t* end = nullptr;
+		const auto bytes = std::wcstoull(a_bytes, &end, 10);
+		if (!end || *end != L'\0')
+			return ManifestArtifact{};
+		return ManifestArtifact{
+			.path = a_path,
+			.bytes = static_cast<std::uint64_t>(bytes),
+			.sha256 = narrowAscii(a_sha256),
+		};
+	};
+	if (a_argumentCount == 6 && std::wstring_view(a_arguments[1]) == L"--expect-failure")
+		return RunComposition(
+			manifestArtifact(a_arguments[3], a_arguments[4], a_arguments[5]),
+			narrowAscii(a_arguments[2]), true);
+	if (a_argumentCount == 6 && std::wstring_view(a_arguments[1]) == L"--race")
+		return RaceComposition(
+			manifestArtifact(a_arguments[3], a_arguments[4], a_arguments[5]),
+			narrowAscii(a_arguments[2]));
+	if (a_argumentCount == 6 && std::wstring_view(a_arguments[1]) == L"--verify-manifest-lock")
+		return RunComposition(
+			manifestArtifact(a_arguments[3], a_arguments[4], a_arguments[5]),
+			narrowAscii(a_arguments[2]), false, true);
 	if (a_argumentCount == 3 && std::wstring_view(a_arguments[1]) == L"--verify-orientation")
 		return VerifyOrientation(a_arguments[2]);
 	if (a_argumentCount == 4 && std::wstring_view(a_arguments[1]) == L"--verify-sample-count") {
@@ -432,11 +488,14 @@ int wmain(int a_argumentCount, wchar_t** a_arguments)
 			return 2;
 		return VerifySampleCount(a_arguments[3], static_cast<std::size_t>(expected));
 	}
-	if (a_argumentCount == 3)
-		return RunComposition(a_arguments[2], requestId(a_arguments[1]), false);
+	if (a_argumentCount == 5)
+		return RunComposition(
+			manifestArtifact(a_arguments[2], a_arguments[3], a_arguments[4]),
+			narrowAscii(a_arguments[1]), false);
 
-	std::cerr << "Usage: CSXCaptureComposerSmoke [--expect-failure|--race] <request-id> <path>\n"
-		         "       CSXCaptureComposerSmoke <request-id> <path>\n"
+	std::cerr << "Usage: CSXCaptureComposerSmoke [--expect-failure|--race|--verify-manifest-lock] "
+		         "<request-id> <manifest> <bytes> <sha256>\n"
+		         "       CSXCaptureComposerSmoke <request-id> <manifest> <bytes> <sha256>\n"
 		         "       CSXCaptureComposerSmoke --verify-orientation <path>\n"
 		         "       CSXCaptureComposerSmoke --verify-sample-count <count> <path>\n";
 	return 2;
