@@ -27,6 +27,8 @@ namespace
 #ifdef CSX_CAPTURE_COMPOSER_TESTING
 	std::atomic_bool g_manifestRenameBlocked{ false };
 	std::atomic_bool g_manifestRenameAttempted{ false };
+	std::atomic_bool g_outputReplacementBlocked{ false };
+	std::atomic_bool g_outputReplacementAttempted{ false };
 
 	void AttemptManifestRename(const std::filesystem::path& a_manifest)
 	{
@@ -37,6 +39,24 @@ namespace
 			const auto error = GetLastError();
 			g_manifestRenameBlocked =
 				error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED;
+		}
+	}
+
+	void AttemptOutputReplacement(const std::filesystem::path& a_temporary)
+	{
+		g_outputReplacementAttempted = true;
+		auto replacement = a_temporary;
+		replacement += L".replacement";
+		if (!CopyFileW(a_temporary.c_str(), replacement.c_str(), TRUE))
+			return;
+		if (!MoveFileExW(
+				replacement.c_str(),
+				a_temporary.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+			const auto error = GetLastError();
+			g_outputReplacementBlocked =
+				error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED;
+			DeleteFileW(replacement.c_str());
 		}
 	}
 #endif
@@ -157,7 +177,8 @@ namespace
 		ManifestArtifact a_manifest,
 		std::string a_requestId,
 		bool a_expectFailure,
-		bool a_verifyManifestLock = false)
+		bool a_verifyManifestLock = false,
+		bool a_verifyOutputLock = false)
 	{
 		auto& composer = Composer();
 #ifdef CSX_CAPTURE_COMPOSER_TESTING
@@ -166,8 +187,14 @@ namespace
 			g_manifestRenameBlocked = false;
 			CSXCaptureCompanion::SetManifestCustodyTestHook(&AttemptManifestRename);
 		}
+		if (a_verifyOutputLock) {
+			g_outputReplacementAttempted = false;
+			g_outputReplacementBlocked = false;
+			CSXCaptureCompanion::SetOutputCustodyTestHook(&AttemptOutputReplacement);
+		}
 #else
 		(void)a_verifyManifestLock;
+		(void)a_verifyOutputLock;
 #endif
 		if (!composer.Queue(std::move(a_manifest), std::move(a_requestId))) {
 			std::cerr << "Composer rejected the smoke-test sequence before starting its worker.\n";
@@ -176,10 +203,16 @@ namespace
 		const auto result = WaitForComposition(a_expectFailure);
 #ifdef CSX_CAPTURE_COMPOSER_TESTING
 		CSXCaptureCompanion::SetManifestCustodyTestHook(nullptr);
+		CSXCaptureCompanion::SetOutputCustodyTestHook(nullptr);
 		if (a_verifyManifestLock &&
 			(!g_manifestRenameAttempted.load() || !g_manifestRenameBlocked.load())) {
 			std::cerr << "Manifest replacement was not denied while the custody handle was held.\n";
 			return 11;
+		}
+		if (a_verifyOutputLock &&
+			(!g_outputReplacementAttempted.load() || !g_outputReplacementBlocked.load())) {
+			std::cerr << "Finalized MP4 replacement was not denied while the custody handle was held.\n";
+			return 12;
 		}
 #endif
 		return result;
@@ -479,6 +512,10 @@ int wmain(int a_argumentCount, wchar_t** a_arguments)
 		return RunComposition(
 			manifestArtifact(a_arguments[3], a_arguments[4], a_arguments[5]),
 			narrowAscii(a_arguments[2]), false, true);
+	if (a_argumentCount == 6 && std::wstring_view(a_arguments[1]) == L"--verify-output-lock")
+		return RunComposition(
+			manifestArtifact(a_arguments[3], a_arguments[4], a_arguments[5]),
+			narrowAscii(a_arguments[2]), false, false, true);
 	if (a_argumentCount == 3 && std::wstring_view(a_arguments[1]) == L"--verify-orientation")
 		return VerifyOrientation(a_arguments[2]);
 	if (a_argumentCount == 4 && std::wstring_view(a_arguments[1]) == L"--verify-sample-count") {
@@ -493,7 +530,8 @@ int wmain(int a_argumentCount, wchar_t** a_arguments)
 			manifestArtifact(a_arguments[2], a_arguments[3], a_arguments[4]),
 			narrowAscii(a_arguments[1]), false);
 
-	std::cerr << "Usage: CSXCaptureComposerSmoke [--expect-failure|--race|--verify-manifest-lock] "
+	std::cerr << "Usage: CSXCaptureComposerSmoke "
+		         "[--expect-failure|--race|--verify-manifest-lock|--verify-output-lock] "
 		         "<request-id> <manifest> <bytes> <sha256>\n"
 		         "       CSXCaptureComposerSmoke <request-id> <manifest> <bytes> <sha256>\n"
 		         "       CSXCaptureComposerSmoke --verify-orientation <path>\n"

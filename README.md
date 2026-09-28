@@ -54,6 +54,9 @@ worker consumes `sequence.json` only after CSX reports the session complete.
 Windows Imaging Component decodes the lossless BMP or PNG frames and Windows Media Foundation
 encodes H.264 in an MP4 container. Encoding never runs on the render thread,
 source frames are retained, and output is committed only after finalization.
+The finalized temporary remains open without write/delete sharing and is
+renamed by that exact file handle with no replacement; the same file identity
+is verified at the deterministic final path before completion is reported.
 
 Left and Right sessions produce one `-left.mp4` or `-right.mp4` beside the frame
 set. Both-eye sessions produce one half-SBS-compatible `-sbs.mp4`, with the left
@@ -89,8 +92,9 @@ plugin builder, compiled and reviewable Papyrus assets, and a package script.
 The MCM quest follows the proven `ThrowingStuffVR` SkyUI structure, including
 the `SKI_PlayerLoadGameAlias` reload bridge.
 
-Configure with a CommonLibSSE-NG package available to CMake, or point at a
-CommonLibSSE-NG source checkout, then build normally:
+Configure with the clean CommonLibSSE-NG `v6.7.0` source checkout at commit
+`3d81614617910e7f34b33d8750881811b5e36445` and the matching prebuilt package,
+then build normally:
 
 ```powershell
 cmake -S . -B build -DCOMMONLIBSSE_SOURCE_DIR=<path-to-CommonLibSSE-NG>
@@ -105,7 +109,10 @@ install staging, and ZIP creation:
 ```
 
 The resulting archive is `dist\CSXCaptureCompanion-0.1.1.zip`. The deterministic
-record builder can be run or verified independently:
+package build rejects a dirty or mismatched CommonLib checkout and records the
+verified source commit, prebuilt identity, toolset, version, and notice URL in
+`Docs\CSX Capture Companion\dependency-provenance.json` inside the archive.
+The deterministic record builder can be run or verified independently:
 
 ```powershell
 dotnet run --project tools\BuildPlugin\BuildPlugin.csproj -c Release -- Data\CSXCaptureCompanion.esp

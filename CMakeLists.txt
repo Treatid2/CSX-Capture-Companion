@@ -170,5 +170,15 @@ if(BUILD_TESTING)
 		NAME package-provenance
 		COMMAND
 			pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/Test-DependencyProvenance.ps1"
+			-CommonLibSseSource "${COMMONLIBSSE_SOURCE_DIR}"
+			-CommonLibSsePrebuilt "${COMMONLIB_PREBUILT_DIR}"
+	)
+	add_test(
+		NAME package-provenance-mismatch
+		COMMAND
+			pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/Test-DependencyProvenanceMismatch.ps1"
+			-ProvenanceScript "${CMAKE_CURRENT_SOURCE_DIR}/tools/Test-DependencyProvenance.ps1"
+			-CommonLibSsePrebuilt "${COMMONLIB_PREBUILT_DIR}"
+			-WorkRoot "${CMAKE_CURRENT_BINARY_DIR}/package-provenance-mismatch"
 	)
 endif()

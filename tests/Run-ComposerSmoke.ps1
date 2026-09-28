@@ -472,6 +472,19 @@ if (Test-Path -LiteralPath ($manifestLockCustody.Path + '.moved')) {
 	throw 'Manifest custody test unexpectedly moved the manifest.'
 }
 
+$outputLockSequence = Join-Path $resolvedWorkRoot 'CS_sequence_output_lock'
+Write-TestManifest -Sequence $outputLockSequence -Suffixes @('left') `
+	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)
+$outputLockCustody = Get-ManifestCustody -Sequence $outputLockSequence
+& $Executable --verify-output-lock 'fixture-sequence' $outputLockCustody.Path `
+	$outputLockCustody.Bytes $outputLockCustody.Sha256
+if ($LASTEXITCODE -ne 0) {
+	throw 'Finalized MP4 custody did not deny same-size replacement before publication.'
+}
+if (Get-ChildItem -LiteralPath $outputLockSequence -Filter '*.replacement' -File) {
+	throw 'Finalized MP4 custody test left a replacement artifact behind.'
+}
+
 $collisionSequence = Join-Path $resolvedWorkRoot 'CS_sequence_unverified_collision'
 Write-TestManifest -Sequence $collisionSequence -Suffixes @('left') `
 	-Timestamps @([uint64]1000) -ArtifactPaths @($leftSource.FullName)

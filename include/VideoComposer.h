@@ -18,6 +18,8 @@ namespace CSXCaptureCompanion
 #ifdef CSX_CAPTURE_COMPOSER_TESTING
 	using ManifestCustodyTestHook = void (*)(const std::filesystem::path&);
 	void SetManifestCustodyTestHook(ManifestCustodyTestHook a_hook) noexcept;
+	using OutputCustodyTestHook = void (*)(const std::filesystem::path&);
+	void SetOutputCustodyTestHook(OutputCustodyTestHook a_hook) noexcept;
 #endif
 
 	enum class ComposeState : std::int32_t

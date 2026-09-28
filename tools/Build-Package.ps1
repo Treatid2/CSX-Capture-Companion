@@ -15,8 +15,9 @@ $dependencyMetadata = Import-PowerShellDataFile -LiteralPath (Join-Path $PSScrip
 if (-not $CommonLibSsePrebuilt) {
     $CommonLibSsePrebuilt = $dependencyMetadata.CommonLibSseNg.PrebuiltDirectory
 }
-& (Join-Path $PSScriptRoot 'Test-DependencyProvenance.ps1') `
-    -CommonLibSsePrebuilt $CommonLibSsePrebuilt | Out-Null
+$dependencyProvenance = & (Join-Path $PSScriptRoot 'Test-DependencyProvenance.ps1') `
+    -CommonLibSseSource $CommonLibSseSource `
+    -CommonLibSsePrebuilt $CommonLibSsePrebuilt
 $buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDirectory)) {
     [System.IO.Path]::GetFullPath($BuildDirectory)
 } else {
@@ -61,7 +62,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Native build failed with exit code $LASTEXITCODE."
 }
 & ctest --test-dir $buildRoot -C Release --output-on-failure `
-    -R '^(composer-smoke|capture-session|capture-controller|package-provenance)$'
+    -R '^(composer-smoke|capture-session|capture-controller|package-provenance|package-provenance-mismatch)$'
 if ($LASTEXITCODE -ne 0) {
     throw "Native tests failed with exit code $LASTEXITCODE."
 }
@@ -80,6 +81,15 @@ New-Item -ItemType Directory -Force -Path $normalizedStage, $distRoot | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "CMake install failed with exit code $LASTEXITCODE."
 }
+
+$provenanceDirectory = Join-Path $normalizedStage 'Docs\CSX Capture Companion'
+[System.IO.Directory]::CreateDirectory($provenanceDirectory) | Out-Null
+$provenancePath = Join-Path $provenanceDirectory 'dependency-provenance.json'
+$provenanceJson = $dependencyProvenance | ConvertTo-Json -Depth 4
+[System.IO.File]::WriteAllText(
+    $provenancePath,
+    $provenanceJson + "`n",
+    [System.Text.UTF8Encoding]::new($false))
 
 Compress-Archive -Path (Join-Path $normalizedStage '*') -DestinationPath $archivePath -Force
 $archive = Get-Item -LiteralPath $archivePath

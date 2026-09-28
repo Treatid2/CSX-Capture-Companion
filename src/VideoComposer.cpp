@@ -16,6 +16,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
+#include <cstring>
 #include <cwctype>
 #include <limits>
 #include <optional>
@@ -23,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace CSXCaptureCompanion
@@ -32,6 +35,7 @@ namespace CSXCaptureCompanion
 		std::atomic<NotificationCallback> g_notificationCallback{ nullptr };
 #ifdef CSX_CAPTURE_COMPOSER_TESTING
 		std::atomic<ManifestCustodyTestHook> g_manifestCustodyTestHook{ nullptr };
+		std::atomic<OutputCustodyTestHook> g_outputCustodyTestHook{ nullptr };
 #endif
 	}
 
@@ -51,6 +55,11 @@ namespace CSXCaptureCompanion
 	void SetManifestCustodyTestHook(ManifestCustodyTestHook a_hook) noexcept
 	{
 		g_manifestCustodyTestHook.store(a_hook, std::memory_order_release);
+	}
+
+	void SetOutputCustodyTestHook(OutputCustodyTestHook a_hook) noexcept
+	{
+		g_outputCustodyTestHook.store(a_hook, std::memory_order_release);
 	}
 #endif
 
@@ -182,11 +191,94 @@ namespace CSXCaptureCompanion
 			}
 			FileHandle(const FileHandle&) = delete;
 			FileHandle& operator=(const FileHandle&) = delete;
+			FileHandle(FileHandle&& a_other) noexcept : handle(std::exchange(a_other.handle, INVALID_HANDLE_VALUE)) {}
+			FileHandle& operator=(FileHandle&& a_other) noexcept
+			{
+				if (this != &a_other) {
+					if (handle != INVALID_HANDLE_VALUE)
+						CloseHandle(handle);
+					handle = std::exchange(a_other.handle, INVALID_HANDLE_VALUE);
+				}
+				return *this;
+			}
 			[[nodiscard]] HANDLE Get() const noexcept { return handle; }
 
 		private:
 			HANDLE handle{ INVALID_HANDLE_VALUE };
 		};
+
+		struct FileIdentity
+		{
+			DWORD volumeSerialNumber{};
+			DWORD fileIndexHigh{};
+			DWORD fileIndexLow{};
+
+			bool operator==(const FileIdentity&) const = default;
+		};
+
+		struct EncodedOutput
+		{
+			FileHandle file;
+			FileIdentity identity;
+		};
+
+		FileIdentity ReadFileIdentity(HANDLE a_file)
+		{
+			BY_HANDLE_FILE_INFORMATION information{};
+			if (!GetFileInformationByHandle(a_file, &information))
+				throw std::runtime_error("An encoded video file identity could not be read.");
+			return {
+				.volumeSerialNumber = information.dwVolumeSerialNumber,
+				.fileIndexHigh = information.nFileIndexHigh,
+				.fileIndexLow = information.nFileIndexLow,
+			};
+		}
+
+		std::filesystem::path ReadFinalPath(HANDLE a_file, std::string_view a_description)
+		{
+			const auto pathLength = GetFinalPathNameByHandleW(
+				a_file, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (pathLength == 0)
+				throw std::runtime_error(std::string(a_description) + " path could not be verified.");
+			std::wstring pathValue(pathLength, L'\0');
+			const auto written = GetFinalPathNameByHandleW(
+				a_file, pathValue.data(), pathLength, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			if (written == 0 || written >= pathLength)
+				throw std::runtime_error(std::string(a_description) + " path could not be verified.");
+			pathValue.resize(written);
+			if (pathValue.starts_with(L"\\\\?\\"))
+				pathValue.erase(0, 4);
+			return pathValue;
+		}
+
+		void RenameFileHandleNoReplace(
+			HANDLE a_file,
+			const std::filesystem::path& a_destination)
+		{
+			const auto destination = std::filesystem::absolute(a_destination).lexically_normal().wstring();
+			if (destination.empty() ||
+				destination.size() > (std::numeric_limits<DWORD>::max() / sizeof(wchar_t))) {
+				throw std::runtime_error("The final video path is invalid.");
+			}
+			const auto nameBytes = static_cast<DWORD>(destination.size() * sizeof(wchar_t));
+			const auto bufferBytes = sizeof(FILE_RENAME_INFO) + nameBytes;
+			if (bufferBytes > std::numeric_limits<DWORD>::max())
+				throw std::runtime_error("The final video path is too long.");
+			std::vector<std::byte> buffer(bufferBytes);
+			auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+			rename->ReplaceIfExists = FALSE;
+			rename->RootDirectory = nullptr;
+			rename->FileNameLength = nameBytes;
+			std::memcpy(rename->FileName, destination.data(), nameBytes);
+			rename->FileName[destination.size()] = L'\0';
+			if (!SetFileInformationByHandle(
+					a_file,
+					FileRenameInfo,
+					rename,
+					static_cast<DWORD>(buffer.size()))) {
+				throw std::runtime_error("Could not commit the completed MP4 output without replacement.");
+			}
+		}
 
 		class AlgorithmHandle final
 		{
@@ -1026,7 +1118,7 @@ namespace CSXCaptureCompanion
 			Check(a_writer->WriteSample(a_streamIndex, sample.Get()), "IMFSinkWriter::WriteSample");
 		}
 
-		void EncodeStream(IWICImagingFactory* a_factory, const EncodingPlan& a_plan)
+		EncodedOutput EncodeStream(IWICImagingFactory* a_factory, const EncodingPlan& a_plan)
 		{
 			const auto first = DecodeOutputFrame(a_factory, a_plan, 0);
 			const auto& timeline = a_plan.primary->frames;
@@ -1115,6 +1207,57 @@ namespace CSXCaptureCompanion
 			}
 
 			Check(writer->Finalize(), "IMFSinkWriter::Finalize");
+
+			FileHandle output(CreateFileW(
+				a_plan.temporary.c_str(),
+				GENERIC_READ | DELETE,
+				FILE_SHARE_READ,
+				nullptr,
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+				nullptr));
+			if (output.Get() == INVALID_HANDLE_VALUE) {
+				throw std::runtime_error(
+					"The finalized MP4 could not be retained under exclusive publication custody.");
+			}
+			if (ComparablePath(ReadFinalPath(output.Get(), "The finalized MP4")) !=
+				ComparablePath(a_plan.temporary)) {
+				throw std::runtime_error("The finalized MP4 resolved outside its reserved temporary path.");
+			}
+			LARGE_INTEGER size{};
+			if (!GetFileSizeEx(output.Get(), &size) || size.QuadPart <= 0)
+				throw std::runtime_error("The finalized MP4 is empty or its size could not be verified.");
+			const auto identity = ReadFileIdentity(output.Get());
+			return { std::move(output), identity };
+		}
+
+		void CommitEncodedOutput(
+			EncodedOutput& a_encoded,
+			const EncodingPlan& a_plan)
+		{
+			if (ReadFileIdentity(a_encoded.file.Get()) != a_encoded.identity)
+				throw std::runtime_error("The finalized MP4 identity changed before publication.");
+			if (ComparablePath(ReadFinalPath(a_encoded.file.Get(), "The finalized MP4")) !=
+				ComparablePath(a_plan.temporary)) {
+				throw std::runtime_error("The finalized MP4 left its reserved temporary path.");
+			}
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+			if (const auto hook = g_outputCustodyTestHook.load(std::memory_order_acquire))
+				hook(a_plan.temporary);
+#endif
+			if (ReadFileIdentity(a_encoded.file.Get()) != a_encoded.identity)
+				throw std::runtime_error("The finalized MP4 identity changed during publication.");
+			if (ComparablePath(ReadFinalPath(a_encoded.file.Get(), "The finalized MP4")) !=
+				ComparablePath(a_plan.temporary)) {
+				throw std::runtime_error("The finalized MP4 path changed during publication.");
+			}
+			RenameFileHandleNoReplace(a_encoded.file.Get(), a_plan.output);
+			if (ReadFileIdentity(a_encoded.file.Get()) != a_encoded.identity)
+				throw std::runtime_error("The published MP4 identity does not match the encoded file.");
+			if (ComparablePath(ReadFinalPath(a_encoded.file.Get(), "The published MP4")) !=
+				ComparablePath(a_plan.output)) {
+				throw std::runtime_error("The published MP4 did not resolve to its deterministic output path.");
+			}
 		}
 	}
 
@@ -1201,13 +1344,8 @@ namespace CSXCaptureCompanion
 			for (const auto& encoding : encodings) {
 				if (std::filesystem::exists(encoding.temporary))
 					throw std::runtime_error("The selected temporary video path is no longer available.");
-				EncodeStream(factory.Get(), encoding);
-				if (!MoveFileExW(
-						encoding.temporary.c_str(),
-						encoding.output.c_str(),
-						MOVEFILE_WRITE_THROUGH)) {
-					throw std::runtime_error("Could not commit the completed MP4 output.");
-				}
+				auto encoded = EncodeStream(factory.Get(), encoding);
+				CommitEncodedOutput(encoded, encoding);
 				completedOutputs.push_back(encoding.output);
 			}
 

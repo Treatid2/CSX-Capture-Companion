@@ -12,6 +12,8 @@ and additional permissions.
 
 Source: <https://github.com/alandtse/CommonLibSSE-NG/tree/v6.7.0>
 
+Release source commit: `3d81614617910e7f34b33d8750881811b5e36445`
+
 Licence: GPL-3.0-or-later with the CommonLibSSE-NG Modding Exception and
 GPL-3.0 Linking Exception (with Corresponding Source). The binary contains
 CommonLibSSE-NG as a statically linked library. See:
