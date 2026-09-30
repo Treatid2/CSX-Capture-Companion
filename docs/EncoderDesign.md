@@ -75,9 +75,11 @@ without write/delete sharing while its current size and digest are verified
 immediately before WIC decodes it. Outputs are unique leaf names beside the
 frame-set directory and cannot
 alias a source. Each job uses a new temporary name; an unrelated pre-existing
-temporary file is never removed. After `IMFSinkWriter::Finalize` succeeds, the
-worker opens the exact finalized temporary for read/delete access without
-write or delete sharing. It records the file identity, performs a handle-bound
-no-replace rename, and verifies the same identity at the deterministic final
-path before reporting completion. The worker never edits `sequence.json`, never
-deletes source frame files, and never writes into the Skyrim game directory.
+temporary file is never removed. The worker creates the temporary itself,
+records its identity, and gives Media Foundation an `IMFByteStream` backed by
+an `IStream` over that already-open handle. The producer handle remains open
+without write/delete sharing for the complete encode and finalization. The
+worker then performs a handle-bound no-replace rename and verifies the same
+identity at the deterministic final path before reporting completion. The
+worker never edits `sequence.json`, never deletes source frame files, and never
+writes into the Skyrim game directory.

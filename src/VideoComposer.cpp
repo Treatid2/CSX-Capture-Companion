@@ -207,6 +207,158 @@ namespace CSXCaptureCompanion
 			HANDLE handle{ INVALID_HANDLE_VALUE };
 		};
 
+		class HandleStream final : public IStream
+		{
+		public:
+			explicit HandleStream(HANDLE a_file) : file(a_file) {}
+
+			HRESULT STDMETHODCALLTYPE QueryInterface(REFIID a_id, void** a_object) override
+			{
+				if (!a_object)
+					return E_POINTER;
+				*a_object = nullptr;
+				if (a_id == IID_IUnknown || a_id == IID_ISequentialStream || a_id == IID_IStream) {
+					*a_object = static_cast<IStream*>(this);
+					AddRef();
+					return S_OK;
+				}
+				return E_NOINTERFACE;
+			}
+
+			ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+			ULONG STDMETHODCALLTYPE Release() override
+			{
+				const auto remaining = --references;
+				if (remaining == 0)
+					delete this;
+				return remaining;
+			}
+
+			HRESULT STDMETHODCALLTYPE Read(void* a_buffer, ULONG a_bytes, ULONG* a_read) override
+			{
+				if (!a_buffer && a_bytes != 0)
+					return STG_E_INVALIDPOINTER;
+				std::lock_guard lock(fileMutex);
+				DWORD read = 0;
+				if (!ReadFile(file, a_buffer, a_bytes, &read, nullptr))
+					return HRESULT_FROM_WIN32(GetLastError());
+				if (a_read)
+					*a_read = read;
+				return read == a_bytes ? S_OK : S_FALSE;
+			}
+
+			HRESULT STDMETHODCALLTYPE Write(const void* a_buffer, ULONG a_bytes, ULONG* a_written) override
+			{
+				if (!a_buffer && a_bytes != 0)
+					return STG_E_INVALIDPOINTER;
+				std::lock_guard lock(fileMutex);
+				DWORD written = 0;
+				if (!WriteFile(file, a_buffer, a_bytes, &written, nullptr))
+					return HRESULT_FROM_WIN32(GetLastError());
+				if (a_written)
+					*a_written = written;
+				return written == a_bytes ? S_OK : STG_E_WRITEFAULT;
+			}
+
+			HRESULT STDMETHODCALLTYPE Seek(
+				LARGE_INTEGER a_move, DWORD a_origin, ULARGE_INTEGER* a_position) override
+			{
+				DWORD method = FILE_BEGIN;
+				if (a_origin == STREAM_SEEK_CUR)
+					method = FILE_CURRENT;
+				else if (a_origin == STREAM_SEEK_END)
+					method = FILE_END;
+				else if (a_origin != STREAM_SEEK_SET)
+					return STG_E_INVALIDFUNCTION;
+				std::lock_guard lock(fileMutex);
+				LARGE_INTEGER position{};
+				if (!SetFilePointerEx(file, a_move, &position, method))
+					return HRESULT_FROM_WIN32(GetLastError());
+				if (a_position)
+					a_position->QuadPart = static_cast<ULONGLONG>(position.QuadPart);
+				return S_OK;
+			}
+
+			HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER a_size) override
+			{
+				if (a_size.QuadPart > static_cast<ULONGLONG>(std::numeric_limits<LONGLONG>::max()))
+					return STG_E_INVALIDFUNCTION;
+				std::lock_guard lock(fileMutex);
+				LARGE_INTEGER zero{};
+				LARGE_INTEGER original{};
+				if (!SetFilePointerEx(file, zero, &original, FILE_CURRENT))
+					return HRESULT_FROM_WIN32(GetLastError());
+				LARGE_INTEGER end{ .QuadPart = static_cast<LONGLONG>(a_size.QuadPart) };
+				if (!SetFilePointerEx(file, end, nullptr, FILE_BEGIN) || !SetEndOfFile(file))
+					return HRESULT_FROM_WIN32(GetLastError());
+				original.QuadPart = std::min(original.QuadPart, end.QuadPart);
+				if (!SetFilePointerEx(file, original, nullptr, FILE_BEGIN))
+					return HRESULT_FROM_WIN32(GetLastError());
+				return S_OK;
+			}
+
+			HRESULT STDMETHODCALLTYPE CopyTo(
+				IStream* a_destination, ULARGE_INTEGER a_bytes,
+				ULARGE_INTEGER* a_read, ULARGE_INTEGER* a_written) override
+			{
+				if (!a_destination)
+					return STG_E_INVALIDPOINTER;
+				std::array<std::byte, 64 * 1024> buffer{};
+				ULONGLONG totalRead = 0;
+				ULONGLONG totalWritten = 0;
+				while (totalRead < a_bytes.QuadPart) {
+					const auto requested = static_cast<ULONG>(std::min<ULONGLONG>(
+						buffer.size(), a_bytes.QuadPart - totalRead));
+					ULONG read = 0;
+					const auto readResult = Read(buffer.data(), requested, &read);
+					if (FAILED(readResult))
+						return readResult;
+					if (read == 0)
+						break;
+					ULONG written = 0;
+					const auto writeResult = a_destination->Write(buffer.data(), read, &written);
+					totalRead += read;
+					totalWritten += written;
+					if (FAILED(writeResult) || written != read)
+						return STG_E_WRITEFAULT;
+				}
+				if (a_read)
+					a_read->QuadPart = totalRead;
+				if (a_written)
+					a_written->QuadPart = totalWritten;
+				return totalRead == a_bytes.QuadPart ? S_OK : S_FALSE;
+			}
+
+			HRESULT STDMETHODCALLTYPE Commit(DWORD) override
+			{
+				std::lock_guard lock(fileMutex);
+				return FlushFileBuffers(file) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+			}
+			HRESULT STDMETHODCALLTYPE Revert() override { return STG_E_REVERTED; }
+			HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+			HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+			HRESULT STDMETHODCALLTYPE Stat(STATSTG* a_stat, DWORD) override
+			{
+				if (!a_stat)
+					return STG_E_INVALIDPOINTER;
+				std::lock_guard lock(fileMutex);
+				LARGE_INTEGER size{};
+				if (!GetFileSizeEx(file, &size))
+					return HRESULT_FROM_WIN32(GetLastError());
+				*a_stat = {};
+				a_stat->type = STGTY_STREAM;
+				a_stat->cbSize.QuadPart = static_cast<ULONGLONG>(size.QuadPart);
+				a_stat->grfMode = STGM_READWRITE | STGM_SHARE_DENY_WRITE;
+				return S_OK;
+			}
+			HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+
+		private:
+			std::atomic_ulong references{ 1 };
+			HANDLE file;
+			std::mutex fileMutex;
+		};
+
 		struct FileIdentity
 		{
 			DWORD volumeSerialNumber{};
@@ -278,6 +430,13 @@ namespace CSXCaptureCompanion
 					static_cast<DWORD>(buffer.size()))) {
 				throw std::runtime_error("Could not commit the completed MP4 output without replacement.");
 			}
+		}
+
+		void DeleteFileHandle(HANDLE a_file) noexcept
+		{
+			FILE_DISPOSITION_INFO disposition{ .DeleteFile = TRUE };
+			SetFileInformationByHandle(
+				a_file, FileDispositionInfo, &disposition, sizeof(disposition));
 		}
 
 		class AlgorithmHandle final
@@ -1131,18 +1290,43 @@ namespace CSXCaptureCompanion
 				kMaximumVideoBitrate);
 			const auto bitrate = static_cast<std::uint32_t>(bitrate64);
 
-			ComPtr<IMFAttributes> attributes;
-			Check(MFCreateAttributes(attributes.GetAddressOf(), 2), "MFCreateAttributes");
-			Check(attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE), "IMFAttributes::SetUINT32");
-			Check(attributes->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE), "IMFAttributes::SetUINT32");
-
-			ComPtr<IMFSinkWriter> writer;
-			Check(MFCreateSinkWriterFromURL(
+			FileHandle output(CreateFileW(
 				a_plan.temporary.c_str(),
+				GENERIC_READ | GENERIC_WRITE | DELETE,
+				FILE_SHARE_READ,
 				nullptr,
-				attributes.Get(),
-				writer.GetAddressOf()),
-				"MFCreateSinkWriterFromURL");
+				CREATE_NEW,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+				nullptr));
+			if (output.Get() == INVALID_HANDLE_VALUE)
+				throw std::runtime_error("The temporary MP4 could not be created under producer custody.");
+			const auto identity = ReadFileIdentity(output.Get());
+			try {
+				if (ComparablePath(ReadFinalPath(output.Get(), "The temporary MP4")) !=
+					ComparablePath(a_plan.temporary)) {
+					throw std::runtime_error("The temporary MP4 resolved outside its reserved path.");
+				}
+
+				ComPtr<IStream> stream;
+				stream.Attach(new HandleStream(output.Get()));
+				ComPtr<IMFByteStream> byteStream;
+				Check(MFCreateMFByteStreamOnStream(stream.Get(), byteStream.GetAddressOf()),
+					"MFCreateMFByteStreamOnStream");
+
+				ComPtr<IMFAttributes> attributes;
+				Check(MFCreateAttributes(attributes.GetAddressOf(), 3), "MFCreateAttributes");
+				Check(attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE), "IMFAttributes::SetUINT32");
+				Check(attributes->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE), "IMFAttributes::SetUINT32");
+				Check(attributes->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4),
+					"Set MPEG-4 container type");
+
+				ComPtr<IMFSinkWriter> writer;
+				Check(MFCreateSinkWriterFromURL(
+					nullptr,
+					byteStream.Get(),
+					attributes.Get(),
+					writer.GetAddressOf()),
+					"MFCreateSinkWriterFromURL");
 
 			ComPtr<IMFMediaType> outputType;
 			Check(MFCreateMediaType(outputType.GetAddressOf()), "MFCreateMediaType(output)");
@@ -1206,29 +1390,27 @@ namespace CSXCaptureCompanion
 					static_cast<LONGLONG>(trailingTick) * sampleDuration, sampleDuration);
 			}
 
-			Check(writer->Finalize(), "IMFSinkWriter::Finalize");
-
-			FileHandle output(CreateFileW(
-				a_plan.temporary.c_str(),
-				GENERIC_READ | DELETE,
-				FILE_SHARE_READ,
-				nullptr,
-				OPEN_EXISTING,
-				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-				nullptr));
-			if (output.Get() == INVALID_HANDLE_VALUE) {
-				throw std::runtime_error(
-					"The finalized MP4 could not be retained under exclusive publication custody.");
+				Check(writer->Finalize(), "IMFSinkWriter::Finalize");
+				writer.Reset();
+				byteStream.Reset();
+				stream.Reset();
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+				if (const auto hook = g_outputCustodyTestHook.load(std::memory_order_acquire))
+					hook(a_plan.temporary);
+#endif
+				if (ReadFileIdentity(output.Get()) != identity ||
+					ComparablePath(ReadFinalPath(output.Get(), "The finalized MP4")) !=
+						ComparablePath(a_plan.temporary)) {
+					throw std::runtime_error("The finalized MP4 changed while producer custody was retained.");
+				}
+				LARGE_INTEGER size{};
+				if (!GetFileSizeEx(output.Get(), &size) || size.QuadPart <= 0)
+					throw std::runtime_error("The finalized MP4 is empty or its size could not be verified.");
+				return { std::move(output), identity };
+			} catch (...) {
+				DeleteFileHandle(output.Get());
+				throw;
 			}
-			if (ComparablePath(ReadFinalPath(output.Get(), "The finalized MP4")) !=
-				ComparablePath(a_plan.temporary)) {
-				throw std::runtime_error("The finalized MP4 resolved outside its reserved temporary path.");
-			}
-			LARGE_INTEGER size{};
-			if (!GetFileSizeEx(output.Get(), &size) || size.QuadPart <= 0)
-				throw std::runtime_error("The finalized MP4 is empty or its size could not be verified.");
-			const auto identity = ReadFileIdentity(output.Get());
-			return { std::move(output), identity };
 		}
 
 		void CommitEncodedOutput(
@@ -1241,10 +1423,6 @@ namespace CSXCaptureCompanion
 				ComparablePath(a_plan.temporary)) {
 				throw std::runtime_error("The finalized MP4 left its reserved temporary path.");
 			}
-#ifdef CSX_CAPTURE_COMPOSER_TESTING
-			if (const auto hook = g_outputCustodyTestHook.load(std::memory_order_acquire))
-				hook(a_plan.temporary);
-#endif
 			if (ReadFileIdentity(a_encoded.file.Get()) != a_encoded.identity)
 				throw std::runtime_error("The finalized MP4 identity changed during publication.");
 			if (ComparablePath(ReadFinalPath(a_encoded.file.Get(), "The finalized MP4")) !=

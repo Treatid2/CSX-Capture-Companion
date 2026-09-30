@@ -130,6 +130,28 @@ namespace
 			"A valid acceptance reply did not produce its request ID.");
 	}
 
+	bool TestPreparingReceiptRemainsActive()
+	{
+		CaptureSession session([](json request) {
+			if (request.at("action") == "sequence_start")
+				return json{ { "ok", true }, { "result", { { "requestId", "preparing-A" } } } };
+			return json{
+				{ "ok", true },
+				{ "result", {
+					{ "requestId", "preparing-A" },
+					{ "state", "preparing" },
+				} },
+			};
+		});
+
+		return Check(session.Toggle(StartRequest()),
+				   "Could not establish the preparing-state fixture.") &&
+		       Check(session.Refresh() == 1,
+				   "A preparing sequence was not classified as active.") &&
+		       Check(session.ActiveRequestId() == "preparing-A",
+				   "A preparing sequence lost request ownership.");
+	}
+
 	bool TestConcurrentToggle()
 	{
 		std::atomic_int starts{ 0 };
@@ -273,6 +295,7 @@ namespace
 int main()
 {
 	const auto passed = TestMalformedReplies() && TestAcceptedRequestReplies() &&
+	                    TestPreparingReceiptRemainsActive() &&
 	                    TestUnusableStopReceipt() && TestConcurrentToggle() &&
 	                    TestRefreshThenSuccessorStart() && TestToggleDoesNotRestartTerminalCapture() &&
 	                    TestPermanentRefreshClassification();

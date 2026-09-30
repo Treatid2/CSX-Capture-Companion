@@ -105,7 +105,8 @@ namespace CSXCaptureCompanion
 		if (a_state == "failed" || a_state == "failed_partial" || a_state == "rejected" ||
 			a_state == "cancelled" || a_state == "cancelled_partial" || a_state == "dropped")
 			return 4;
-		return a_state == "accepted" || a_state == "waiting_source" ||
+		return a_state == "accepted" || a_state == "preparing" ||
+		       a_state == "waiting_source" ||
 		       a_state == "staged" || a_state == "queued" ||
 		       a_state == "encoding" || a_state == "running" ? 1 : -1;
 	}

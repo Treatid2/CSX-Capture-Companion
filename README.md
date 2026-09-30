@@ -54,9 +54,11 @@ worker consumes `sequence.json` only after CSX reports the session complete.
 Windows Imaging Component decodes the lossless BMP or PNG frames and Windows Media Foundation
 encodes H.264 in an MP4 container. Encoding never runs on the render thread,
 source frames are retained, and output is committed only after finalization.
-The finalized temporary remains open without write/delete sharing and is
-renamed by that exact file handle with no replacement; the same file identity
-is verified at the deterministic final path before completion is reported.
+The companion creates and opens the temporary output itself, gives Media
+Foundation a byte stream over that exact handle, and retains the same identity
+without write/delete sharing through finalization and a no-replace handle
+rename. The identity is verified again at the deterministic final path before
+completion is reported.
 
 Left and Right sessions produce one `-left.mp4` or `-right.mp4` beside the frame
 set. Both-eye sessions produce one half-SBS-compatible `-sbs.mp4`, with the left
