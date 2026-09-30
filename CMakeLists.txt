@@ -13,6 +13,9 @@ if(COMMONLIBSSE_SOURCE_DIR)
         "${CMAKE_CURRENT_BINARY_DIR}/commonlibsse-ng"
         EXCLUDE_FROM_ALL
     )
+    if(NOT COMMAND add_commonlibsse_plugin)
+        include("${COMMONLIBSSE_SOURCE_DIR}/cmake/CommonLibSSE.cmake")
+    endif()
 else()
     find_package(CommonLibSSE CONFIG REQUIRED)
 endif()
@@ -22,6 +25,8 @@ add_commonlibsse_plugin(
     AUTHOR "Treatid2"
     SOURCES
         src/main.cpp
+		src/CaptureController.cpp
+		src/CaptureRuntime.cpp
         src/CaptureSession.cpp
         src/VideoComposer.cpp
 )
@@ -38,6 +43,7 @@ target_link_libraries(
         mfuuid
         windowscodecs
         ole32
+		bcrypt
 )
 
 if(MSVC)
@@ -87,7 +93,13 @@ if(BUILD_TESTING)
     )
     target_compile_features(CSXCaptureComposerSmoke PRIVATE cxx_std_23)
     target_include_directories(CSXCaptureComposerSmoke PRIVATE include)
-    target_compile_definitions(CSXCaptureComposerSmoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(
+        CSXCaptureComposerSmoke
+        PRIVATE
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            CSX_CAPTURE_COMPOSER_TESTING
+    )
     target_precompile_headers(CSXCaptureComposerSmoke PRIVATE include/PCH.h)
     target_link_libraries(
         CSXCaptureComposerSmoke
@@ -98,6 +110,7 @@ if(BUILD_TESTING)
             mfuuid
             windowscodecs
             ole32
+			bcrypt
     )
     if(MSVC)
         target_compile_options(CSXCaptureComposerSmoke PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
@@ -125,4 +138,47 @@ if(BUILD_TESTING)
         target_compile_options(CSXCaptureSessionTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
     endif()
     add_test(NAME capture-session COMMAND CSXCaptureSessionTests)
+
+	add_executable(
+		CSXCaptureControllerTests
+		tests/CaptureControllerTests.cpp
+		src/CaptureController.cpp
+		src/CaptureRuntime.cpp
+		src/CaptureSession.cpp
+		src/VideoComposer.cpp
+	)
+	target_compile_features(CSXCaptureControllerTests PRIVATE cxx_std_23)
+	target_include_directories(CSXCaptureControllerTests PRIVATE include)
+	target_compile_definitions(CSXCaptureControllerTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+	target_precompile_headers(CSXCaptureControllerTests PRIVATE include/PCH.h)
+	target_link_libraries(
+		CSXCaptureControllerTests
+		PRIVATE
+			CommonLibSSE::CommonLibSSE
+			mfplat
+			mfreadwrite
+			mfuuid
+			windowscodecs
+			ole32
+			bcrypt
+	)
+	if(MSVC)
+		target_compile_options(CSXCaptureControllerTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+	endif()
+	add_test(NAME capture-controller COMMAND CSXCaptureControllerTests)
+	add_test(
+		NAME package-provenance
+		COMMAND
+			pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/Test-DependencyProvenance.ps1"
+			-CommonLibSseSource "${COMMONLIBSSE_SOURCE_DIR}"
+			-CommonLibSsePrebuilt "${COMMONLIB_PREBUILT_DIR}"
+	)
+	add_test(
+		NAME package-provenance-mismatch
+		COMMAND
+			pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/Test-DependencyProvenanceMismatch.ps1"
+			-ProvenanceScript "${CMAKE_CURRENT_SOURCE_DIR}/tools/Test-DependencyProvenance.ps1"
+			-CommonLibSsePrebuilt "${COMMONLIB_PREBUILT_DIR}"
+			-WorkRoot "${CMAKE_CURRENT_BINARY_DIR}/package-provenance-mismatch"
+	)
 endif()

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ManifestArtifact.h"
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +15,13 @@ namespace CSXCaptureCompanion
 	void SetNotificationCallback(NotificationCallback a_callback) noexcept;
 	void ShowNotification(std::string a_message);
 
+#ifdef CSX_CAPTURE_COMPOSER_TESTING
+	using ManifestCustodyTestHook = void (*)(const std::filesystem::path&);
+	void SetManifestCustodyTestHook(ManifestCustodyTestHook a_hook) noexcept;
+	using OutputCustodyTestHook = void (*)(const std::filesystem::path&);
+	void SetOutputCustodyTestHook(OutputCustodyTestHook a_hook) noexcept;
+#endif
+
 	enum class ComposeState : std::int32_t
 	{
 		kIdle = 0,
@@ -25,13 +34,6 @@ namespace CSXCaptureCompanion
 	class VideoComposer final
 	{
 	public:
-		static VideoComposer& GetSingleton();
-
-		bool Queue(const std::filesystem::path& a_sequenceDirectory);
-		[[nodiscard]] ComposeState GetState() const noexcept;
-		[[nodiscard]] std::string GetStatusText() const;
-
-	private:
 		VideoComposer() = default;
 		~VideoComposer() = default;
 		VideoComposer(const VideoComposer&) = delete;
@@ -39,7 +41,16 @@ namespace CSXCaptureCompanion
 		VideoComposer& operator=(const VideoComposer&) = delete;
 		VideoComposer& operator=(VideoComposer&&) = delete;
 
-		void Run(std::filesystem::path a_sequenceDirectory);
+		bool Queue(
+			ManifestArtifact a_manifest,
+			std::string a_expectedRequestId);
+		[[nodiscard]] ComposeState GetState() const noexcept;
+		[[nodiscard]] std::string GetStatusText() const;
+
+	private:
+		void Run(
+			ManifestArtifact a_manifest,
+			std::string a_expectedRequestId);
 		void SetStatus(ComposeState a_state, std::string a_text);
 
 		std::atomic<ComposeState> state{ ComposeState::kIdle };
